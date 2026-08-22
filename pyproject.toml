@@ -1,0 +1,20 @@
+[project]
+name = "pico-hsm-cli"
+version = "0.1.0"
+description = "Konfigurations-CLI für den Pico-HSM-Teil"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "python-pkcs11>=0.7",
+    "pyotp>=2.9",
+]
+
+[project.scripts]
+pico-hsm-cli = "cli.main:cli"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["cli", "cli.commands", "pico_hsm_tools"]
