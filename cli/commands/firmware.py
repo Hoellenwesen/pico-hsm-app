@@ -5,10 +5,9 @@ from pathlib import Path
 import click
 
 from pico_hsm_tools import flash_core as fc
+from pico_hsm_tools.flash_core import TOTP_SECRET_FILE
 
 from ..context import CliContext, pass_ctx
-
-TOTP_SECRET_FILE = Path.home() / ".pico_hsm" / "totp_secret.txt"
 
 
 @click.group()
@@ -27,7 +26,7 @@ def firmware() -> None:
 def preflight(ctx: CliContext, uf2_file: str) -> None:
     """Signatur, Board-Fingerprint, Rollback prüfen — flasht NICHT."""
     if not fc.verify_audit_chain():
-        ctx.echo("⚠ Audit-Log-Hash-Chain ist gebrochen — Log möglicherweise verändert.")
+        ctx.echo("[WARN] Audit-Log-Hash-Chain ist gebrochen — Log möglicherweise verändert.")
         if not ctx.confirm("Trotzdem fortfahren?"):
             ctx.fail("Abgebrochen.")
             return
@@ -46,7 +45,7 @@ def preflight(ctx: CliContext, uf2_file: str) -> None:
     }
     ctx.emit_json(payload)
     ctx.echo(
-        f"✓ Signatur gültig · Board-Fingerprint stimmt · "
+        f"[OK] Signatur gültig · Board-Fingerprint stimmt · "
         f"Version {payload['version']} (rollback={payload['rollback']}) · "
         f"SHA-256: {payload['sha256']}"
     )
@@ -58,7 +57,7 @@ def preflight(ctx: CliContext, uf2_file: str) -> None:
 def flash(ctx: CliContext, uf2_file: str) -> None:
     """Preflight + TOTP-Autorisierung (falls konfiguriert) + Flash + Audit-Log."""
     if not fc.verify_audit_chain():
-        ctx.echo("⚠ Audit-Log-Hash-Chain ist gebrochen — Log möglicherweise verändert.")
+        ctx.echo("[WARN] Audit-Log-Hash-Chain ist gebrochen — Log möglicherweise verändert.")
         if not ctx.confirm("Trotzdem fortfahren?"):
             ctx.fail("Abgebrochen.")
             return
@@ -70,7 +69,7 @@ def flash(ctx: CliContext, uf2_file: str) -> None:
         return
 
     ctx.echo(
-        f"✓ Vorab-Prüfungen bestanden: Version "
+        f"[OK] Vorab-Prüfungen bestanden: Version "
         f"{result.version.major}.{result.version.minor} "
         f"(rollback={result.version.rollback})"
     )
@@ -85,7 +84,7 @@ def flash(ctx: CliContext, uf2_file: str) -> None:
             })
             ctx.fail("TOTP-Code ungültig oder abgelaufen.")
             return
-        ctx.echo("✓ TOTP-Autorisierung bestätigt.")
+        ctx.echo("[OK] TOTP-Autorisierung bestätigt.")
     else:
         ctx.echo(
             f"Hinweis: keine TOTP-Secret-Datei ({TOTP_SECRET_FILE}) — "
@@ -105,7 +104,7 @@ def flash(ctx: CliContext, uf2_file: str) -> None:
         return
 
     ctx.emit_json({"status": "flashed", "sha256": result.sha256})
-    ctx.echo("✓ Firmware erfolgreich geflasht.")
+    ctx.echo("[OK] Firmware erfolgreich geflasht.")
 
 
 @firmware.group("audit")
@@ -137,6 +136,6 @@ def audit_verify(ctx: CliContext) -> None:
     intact = fc.verify_audit_chain()
     ctx.emit_json({"chain_intact": intact})
     if intact:
-        ctx.echo("✓ Hash-Chain intakt.")
+        ctx.echo("[OK] Hash-Chain intakt.")
     else:
         ctx.fail("Hash-Chain GEBROCHEN.", exit_code=1)

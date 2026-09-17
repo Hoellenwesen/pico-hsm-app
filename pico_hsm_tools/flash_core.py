@@ -196,6 +196,43 @@ def verify_board_identity(expected_fingerprint: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# OTP-Anzeige (read-only): Fingerprint siehe oben, Einzelfelder hier.
+# Konsolidiert aus cli/commands/setup.py (Prinzip "eine Quelle der
+# Wahrheit") — CLI (`setup show`) und GUI (Setup-Tab) nutzen diese
+# Funktionen statt eigenem picotool-Parsing.
+# --------------------------------------------------------------------------
+
+# (picotool-Feldname, Anzeigename) für `setup show` / Setup-Tab.
+OTP_FLAG_FIELDS = [
+    ("OTP_DATA_BOOT_FLAGS0.ROLLBACK_REQUIRED", "anti_rollback_active"),
+    ("OTP_DATA_CRIT1.DEBUG_DISABLE", "swd_debug_locked"),
+    ("OTP_DATA_CRIT1.SECURE_DEBUG_DISABLE", "secure_debug_locked"),
+    ("DEFAULT_BOOT_VERSION0", "current_rollback_counter"),
+]
+
+
+def read_otp_field(field: str) -> str:
+    """Einzelnes OTP-Feld lesen — Anzeige, kein Fehlerwurf.
+
+    Gibt den Wert oder eine lesbare Ersatzmeldung zurück (statt zu
+    werfen: fehlendes Board/picotool ist im Anzeige-Kontext ein
+    erwarteter Zustand, kein Programmfehler).
+    """
+    try:
+        result = subprocess.run(
+            ["picotool", "otp", "get", field],
+            capture_output=True, text=True, timeout=5,
+        )
+    except FileNotFoundError:
+        return "picotool nicht gefunden"
+    except subprocess.TimeoutExpired:
+        return "Timeout beim Lesen"
+    if result.returncode != 0:
+        return f"nicht lesbar ({result.stderr.strip() or 'kein Board?'})"
+    return result.stdout.strip()
+
+
+# --------------------------------------------------------------------------
 # Fix 2: Robustes Parsing (JSON, hart fehlschlagen statt raten)
 # --------------------------------------------------------------------------
 
@@ -326,6 +363,10 @@ def load_last_known() -> dict:
 # ein lokal (in dieser Konfiguration, NICHT im Code) hinterlegtes Secret.
 # --------------------------------------------------------------------------
 
+#: Pfad der lokalen TOTP-Secret-Datei (eine Quelle der Wahrheit für
+#: CLI und GUI; fehlt die Datei, ist die Schicht deaktiviert).
+TOTP_SECRET_FILE = Path.home() / ".pico_hsm" / "totp_secret.txt"
+
 def verify_totp_code(totp_secret_b32: str, entered_code: str) -> bool:
     """entered_code kommt manuell vom Nutzer, abgetippt von einem
     physisch getrennten Gerät (z.B. Bitwarden-App auf dem Handy).
@@ -421,4 +462,4 @@ def do_flash(
         "rollback": preflight.version.rollback,
         "status": "flashed",
     })
-    log("✓ Firmware erfolgreich geflasht")
+    log("[OK] Firmware erfolgreich geflasht")

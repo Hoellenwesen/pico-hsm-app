@@ -29,6 +29,8 @@ class CliContext:
     force: bool = False
     verbose: bool = False
     pin_env: Optional[str] = None
+    gateway_host: Optional[str] = None
+    gateway_port: Optional[int] = None
     _pin_cache: Optional[str] = field(default=None, repr=False)
 
     def get_pin(self, prompt: str = "HSM User-PIN: ") -> str:
@@ -43,11 +45,27 @@ class CliContext:
                 )
             self._pin_cache = value
             return value
-        pin = getpass(prompt)
+        pin = self._read_pin_interactive(prompt)
         if not pin:
             self.fail("Keine PIN eingegeben.")
         self._pin_cache = pin
         return pin
+
+    def _read_pin_interactive(self, prompt: str) -> str:
+        """PIN interaktiv lesen — mit Hang-Schutz (F4).
+
+        getpass liest unter Windows direkt von der Konsole (msvcrt),
+        nicht von stdin: Ohne TTY (Skript/Pipe/CI) und ohne --pin-env
+        würde es endlos hängen statt zu scheitern. Daher vorher
+        abbrechen mit klarem Hinweis.
+        """
+        if not sys.stdin.isatty():
+            self.fail(
+                "Kein interaktives Terminal für die PIN-Eingabe — bitte "
+                "--pin-env <VAR> mit Umgebungsvariable nutzen."
+            )
+            raise  # unreachable, ctx.fail() beendet den Prozess
+        return getpass(prompt)
 
     def echo(self, message: str) -> None:
         if not self.json_output:

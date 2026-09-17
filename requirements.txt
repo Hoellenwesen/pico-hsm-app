@@ -1,3 +1,0 @@
-click>=8.1
-python-pkcs11>=0.7
-pyotp>=2.9

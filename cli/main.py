@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pico-hsm-cli — Konfigurations-CLI für den Pico-HSM-Teil von pqvault.
+pico-hsm-cli — Konfigurations-CLI für den Pico-HSM-Teil des PicoHSM-Projekts.
 
 Nutzung:
   pico-hsm-cli status all
@@ -27,8 +27,18 @@ from .context import CliContext
 @click.group()
 @click.option("--pkcs11-lib", default=None, help="Pfad zur PKCS#11-Library (Override).")
 @click.option("--json", "json_output", is_flag=True, help="Maschinenlesbare JSON-Ausgabe.")
-@click.option("--force", is_flag=True, help="Bestätigungen überspringen (auch Daemon-Konflikt).")
+@click.option("--force", is_flag=True, help="Bestätigungen überspringen.")
 @click.option("--pin-env", default=None, help="Umgebungsvariable mit der HSM-PIN.")
+@click.option(
+    "--gateway-host", default=None,
+    help=(
+        "Hostname/IP des HSM-API-Gateways — nur für den rein "
+        "informativen Erreichbarkeits-Check (siehe `status gateway`, "
+        "Konflikt-Hinweise bei belegtem Reader). Ohne Angabe gilt das "
+        "Gateway als nicht erreichbar, blockiert aber nichts."
+    ),
+)
+@click.option("--gateway-port", default=None, type=int, help="Port des HSM-API-Gateways.")
 @click.option("-v", "--verbose", is_flag=True, help="Debug-Ausgaben auf stderr.")
 @click.pass_context
 def cli(
@@ -37,6 +47,8 @@ def cli(
     json_output: bool,
     force: bool,
     pin_env: str | None,
+    gateway_host: str | None,
+    gateway_port: int | None,
     verbose: bool,
 ) -> None:
     """pico-hsm-cli — Setup, PIN/DKEK, Schlüssel, Backup, Firmware."""
@@ -45,6 +57,8 @@ def cli(
         json_output=json_output,
         force=force,
         pin_env=pin_env,
+        gateway_host=gateway_host,
+        gateway_port=gateway_port,
         verbose=verbose,
     )
 

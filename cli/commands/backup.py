@@ -52,7 +52,7 @@ def split_cmd(
         return
 
     ctx.emit_json(manifest)
-    ctx.echo(f"✓ Backup nach {out_dir} erstellt ({threshold}-von-{total}).")
+    ctx.echo(f"[OK] Backup nach {out_dir} erstellt ({threshold}-von-{total}).")
     ctx.echo(f"  Public Key: {manifest['pubkey']}")
     ctx.echo(
         "  Wichtig: 'shares-DO-NOT-KEEP-TOGETHER.txt' nach lokalem Drill "
@@ -95,7 +95,7 @@ def restore_cmd(
         return
 
     ctx.emit_json({"status": "ok", "output_file": str(output_file)})
-    ctx.echo(f"✓ Wiederhergestellt nach {output_file}.")
+    ctx.echo(f"[OK] Wiederhergestellt nach {output_file}.")
 
 
 @backup.command("drill")
@@ -115,7 +115,7 @@ def drill_cmd(
             ctx.fail(f"Selbsttest fehlgeschlagen: {exc}", exit_code=1)
             return
         ctx.emit_json({"result": "PASS" if ok else "FAIL"})
-        ctx.echo("✓ Selbsttest bestanden." if ok else "✗ Selbsttest fehlgeschlagen.")
+        ctx.echo("[OK] Selbsttest bestanden." if ok else "[FAIL] -> [FEHLER] Selbsttest fehlgeschlagen.")
         if not ok:
             ctx.fail("Selbsttest fehlgeschlagen.", exit_code=1)
         return
@@ -140,7 +140,7 @@ def drill_cmd(
         return
 
     ctx.emit_json({"result": "PASS"})
-    ctx.echo("✓ Drill bestanden, protokolliert in ~/.pico_hsm/recovery_drills.jsonl")
+    ctx.echo("[OK] Drill bestanden, protokolliert in ~/.pico_hsm/recovery_drills.jsonl")
 
 
 @backup.command("list")
@@ -162,10 +162,10 @@ def list_cmd(ctx: CliContext, parent_dir: Path) -> None:
         ctx.echo(f"  Ciphertext-SHA:  {info.ciphertext_sha256 or '?'}")
         if info.leftover_shares_file_present:
             ctx.echo(
-                "  ⚠ shares-DO-NOT-KEEP-TOGETHER.txt liegt noch hier — "
+                "  [WARN] shares-DO-NOT-KEEP-TOGETHER.txt liegt noch hier — "
                 "Gesamt-Secret an einem Ort, nach Drill löschen!"
             )
         if info.last_drill_at:
-            ctx.echo(f"  Letzter Drill:   {info.last_drill_at} → {info.last_drill_result}")
+            ctx.echo(f"  Letzter Drill:   {info.last_drill_at} -> {info.last_drill_result}")
         else:
             ctx.echo("  Letzter Drill:   noch nie getestet — Drill empfohlen!")

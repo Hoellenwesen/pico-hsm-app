@@ -1,0 +1,53 @@
+# --- Python ---------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.dll
+# (nur Artefakte — Quell-.dll-Pfade stehen in den Modulen als Konstanten)
+
+# --- Virtualenvs -------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.virtualenv/
+
+# --- Build/Packaging (setuptools) --------------------------------------
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# --- Tests / Coverage -------------------------------------------------
+.pytest_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+.coverage.xml
+*.pytest_cache
+nosetests.xml
+junit.xml
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# --- IDE / Editor -----------------------------------------------------
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+*.bak
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- AI Stuff ---------------------------------------------------------
+pico-hsm-app-architektur-konzept.md

@@ -7,14 +7,21 @@ dependencies = [
     "click>=8.1",
     "python-pkcs11>=0.7",
     "pyotp>=2.9",
+    "pyscard>=2.0",  # Vendor-APDUs (setup datetime/dynamic-options), siehe apdu_core.py
+    "PySide6>=6.8",  # GUI (Schritt 5), siehe gui/
+    "PySide6-Fluent-Widgets>=1.6",  # Fluent-Design-Komponenten (GPLv3 beachten)
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-qt>=4"]  # pytest-qt: GUI-Smoke-Tests (offscreen)
 
 [project.scripts]
 pico-hsm-cli = "cli.main:cli"
+pico-hsm-gui = "gui.app:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["cli", "cli.commands", "pico_hsm_tools"]
+packages = ["cli", "cli.commands", "pico_hsm_tools", "gui", "gui.tabs"]

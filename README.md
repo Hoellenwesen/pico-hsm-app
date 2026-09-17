@@ -1,36 +1,48 @@
 # pico-hsm-cli
 
-Konfigurations-CLI für den **Pico-HSM-Teil** des `pqvault`-Projekts
-(Homelab-HSM auf Basis Raspberry Pi Pico 2 / RP2350, Firmware-Basis
-`polhenarejos/pico-hsm`). Deckt den kompletten Lebenszyklus ab: Token-
-Ersteinrichtung, PIN-Verwaltung, DKEK-Shares, Schlüsselverwaltung,
+Konfigurations-CLI für den **Pico-HSM-Teil** des PicoHSM-Projekts
+(Homelab-HSM auf Basis Raspberry Pi Pico 2 / RP2350, Firmware: eigener
+Fork [`Hoellenwesen/pico-hsm`](https://github.com/Hoellenwesen/pico-hsm),
+Upstream `polhenarejos/pico-hsm`). Deckt den kompletten Lebenszyklus ab:
+Token-Ersteinrichtung, PIN-Verwaltung, DKEK-Shares, Schlüsselverwaltung,
 Backup/Restore und verifiziertes Firmware-Update — alles über eine
 einzige, konsistente Kommandozeile.
 
-Bewusst **nur CLI, keine GUI** (siehe "Architektur-Entscheidungen"). Eine
-GUI ist als optionaler, dünner Wrapper für später vorgesehen, sobald die
-CLI an echter Hardware verifiziert ist.
+Aktuell im Umbau zu einer App mit primärer GUI und optionalem CLI-Modus,
+die den vollen Firmware-Funktionsumfang abdeckt (Keypair-/AES-Erzeugung,
+Zertifikat-/Datenobjekte, RTC, Dynamic Options, Diagnose-Modus über das
+HSM-Gateway) — siehe das Architekturkonzept-Dokument für Details und
+Umsetzungsstand. Diese README beschreibt den aktuellen CLI-Stand; sie
+wird mit fortschreitendem Umbau aktualisiert.
 
 ---
 
 ## 1. Architektur-Entscheidungen
 
-- **Python statt Rust/Bash**: passt zum bestehenden Projekt-Stack
-  (`python-pkcs11` wird bereits in `hsm_backend.py`/`pqvault` genutzt).
-  Externe Krypto-Tools (`age`, `ssss`, `sc-hsm-tool`, `picotool`) bleiben
-  externe Programme — nur die Orchestrierung ist Python, keine
+- **Python statt Rust/Bash**: Flaschenhals ist immer der Subprozess/das
+  HSM, nie die App-Logik — eine Systemsprache bringt keinen spürbaren
+  Gewinn. Externe Krypto-Tools (`age`, `ssss`, `sc-hsm-tool`, `picotool`)
+  bleiben externe Programme — nur die Orchestrierung ist Python, keine
   Reimplementierung von Kryptografie in Python.
 - **`click`** als CLI-Framework (verschachtelte Subcommand-Gruppen,
   automatische Hilfetexte, saubere Optionen-Validierung).
 - **Eine Quelle der Wahrheit pro Sicherheitsbereich**: `flash_core.py`
   für alles Firmware-Update-Relevante, `backup_core.py` für alles
   Backup/Restore-Relevante — keine Logik-Duplikate zwischen CLI-Befehlen.
-- **Daemon-Konflikt-Schutz**: `pico-hsm-daemon` (Python) und diese CLI
-  dürfen nicht unkoordiniert gleichzeitig auf dasselbe Token zugreifen.
-  Jede schreibende Operation prüft vorab per Socket-Ping, ob der Daemon
-  läuft, und verlangt Bestätigung oder `--force`.
+- **Gateway-bewusster Konflikt-Check**: Der frühere lokale
+  `pico-hsm-daemon` (Unix-Socket) ist laut
+  `pico-hsm-api-connector/MIGRATION.md` komplett durch das HSM-Gateway
+  (mTLS-Netzwerkdienst, exklusiver PKCS#11-Konsument für laufende
+  Crypto-Ops) abgelöst. Diese CLI prüft daher zweistufig: ein rein
+  informativer TCP-Erreichbarkeits-Check gegen das Gateway
+  (`--gateway-host`/`--gateway-port`) plus — beim tatsächlichen Öffnen
+  einer schreibenden PKCS#11-Session — eine gezielte Behandlung der
+  Fehlerklassen, die auf einen belegten Reader hindeuten. Anders als
+  früher gibt es kein „trotzdem fortfahren“ mehr: der Fehler ist dann
+  bereits real aufgetreten, ein Bestätigungsdialog würde nichts ändern.
 - **PIN-Handling**: nie als Klartext-Argument, nie auf Disk — interaktiv
-  per `getpass` oder aus Umgebungsvariable (Muster wie `PQVAULT_HSM_PIN`).
+  per `getpass` oder aus Umgebungsvariable (`--pin-env <VAR>`, Name frei
+  wählbar).
 
 ---
 
@@ -80,8 +92,9 @@ Globale Flags (für alle Befehle):
 |---|---|
 | `--pkcs11-lib <pfad>` | OpenSC-PKCS#11-Modulpfad überschreiben (Windows/Linux/macOS) |
 | `--json` | maschinenlesbare Ausgabe für Skripting |
-| `--force` | Bestätigungen überspringen, inkl. Daemon-Konflikt-Warnung |
+| `--force` | Bestätigungen überspringen |
 | `--pin-env <VAR>` | PIN aus Umgebungsvariable statt Prompt |
+| `--gateway-host <host>` / `--gateway-port <port>` | Adresse des HSM-API-Gateways für den rein informativen Erreichbarkeits-Check (siehe `status gateway`, Konflikt-Hinweise). Ohne Angabe gilt das Gateway als nicht erreichbar, blockiert aber nichts. |
 | `-v/--verbose` | Debug-Ausgaben auf stderr |
 
 Exit-Codes: `0` = OK, `1` = erwarteter/abgelehnter Fall, `2` = unerwarteter Fehler.
@@ -99,20 +112,30 @@ User-PIN, optional Anzahl DKEK-Shares). **Löscht alle vorhandenen Keys**
 
 ```
 pico-hsm-cli status device   # Token-Label, Modell, Seriennummer
-pico-hsm-cli status daemon   # Ist pico-hsm-daemon erreichbar?
+pico-hsm-cli status gateway  # Ist das HSM-API-Gateway erreichbar? (rein informativ)
 pico-hsm-cli status audit    # Hash-Chain-Integrität + letzte Audit-Einträge
 pico-hsm-cli status all      # alle drei kombiniert
 ```
 
-### `setup` — read-only OTP-Anzeige
+### `setup` — OTP-Anzeige, RTC, Dynamic Options
 
 ```
 pico-hsm-cli setup show
+pico-hsm-cli setup datetime get
+pico-hsm-cli setup datetime set 2026-09-16T12:00:00  # oder --now
+pico-hsm-cli setup dynamic-options get
+pico-hsm-cli setup dynamic-options set --press-to-confirm --key-usage-counter
 ```
 Secure-Boot-Pubkey-Fingerprint, Anti-Rollback-Status, Debug-Lock-Status,
-aktueller Rollback-Zähler. Bewusst **kein** `setup set` — OTP-Flags sind
-One-Way-Schalter mit Brick-Risiko; das Setzen bleibt dem dokumentierten
-manuellen Ablauf mit Ersatzboard-Test vorbehalten.
+aktueller Rollback-Zähler (`show`). Bewusst **kein** `setup set` für
+OTP-Flags — One-Way-Schalter mit Brick-Risiko; das Setzen bleibt dem
+dokumentierten manuellen Ablauf mit Ersatzboard-Test vorbehalten.
+`datetime`/`dynamic-options` nutzen Vendor-APDUs direkt über `pyscard`
+(`pico_hsm_tools/apdu_core.py`), kein `opensc-tool`-Textparsing.
+⚠️ Nicht gegen echte Hardware verifiziert (kein Board vorhanden);
+`get_dynamic_options` ist aus dem APDU-Schema abgeleitet, nicht aus
+einem dokumentierten Beispiel. Das Deaktivieren von Press-to-Confirm
+verlangt eine explizite Bestätigung (außer `--force`).
 
 ### `pin` — PIN-Verwaltung
 
@@ -143,9 +166,21 @@ Custodians — unabhängig vom projekteigenen Shamir/age-Schema unter
 pico-hsm-cli keys list                # Label, Klasse, Key-Typ
 pico-hsm-cli keys delete <label>      # mit Bestätigung, außer --force
 pico-hsm-cli keys import              # verweist auf `dkek unwrap-key`
+pico-hsm-cli keys generate --type rsa --bits 2048 --id 01 --label mykey
+pico-hsm-cli keys generate --type ec --curve secp256r1 --id 02 --label myec
+pico-hsm-cli keys generate-aes --bits 256 --id 03 --label myaes
+pico-hsm-cli keys write-object <datei> --label mycert [--id 04] [--not-private]
+pico-hsm-cli keys read-object --label mycert [--out datei]
+pico-hsm-cli keys random <anzahl-bytes>   # Hex-Ausgabe, max. 1024 Byte
 ```
+RSA-Längen: 1024/2048/4096 (2048 >20s, 4096 >20min — CLI blockiert);
+EC-Kurven: secp192r1/secp256r1/secp384r1/secp521r1/secp192k1/secp256k1/
+brainpoolP256r1/brainpoolP384r1/brainpoolP512r1. Datenobjekte max.
+4096 Byte, Default PIN-geschützt (`--not-private` = öffentlich lesbar).
 Bewusst **kein** `keys sign`/`keys derive` — laufende kryptografische
-Operationen bleiben Aufgabe von `pico-hsm-daemon`/`hsm-api-gateway`.
+Operationen bleiben Aufgabe des HSM-API-Gateways (`pico-hsm-api-connector`).
+Ein reiner Diagnose-Modus über das Gateway (kein direkter PKCS#11-Zugriff
+auf Live-Keys) ist als eigene `diagnose`-Kommandogruppe geplant.
 
 ### `backup` — Shamir Secret Sharing + age
 
@@ -185,25 +220,48 @@ Hash-Chain-Audit-Log.
 cli/
 ├── main.py              # click-Gruppe, bindet alle Subcommands ein
 ├── context.py            # CliContext: PIN-Handling, --json, --force, Exit-Codes
-├── pkcs11_helpers.py      # verbindet CliContext mit Daemon-Konflikt-Check
+├── pkcs11_helpers.py      # verbindet CliContext mit Gateway-/Session-Konflikt-Check
 └── commands/
     ├── init.py             # Token-Ersteinrichtung (sc-hsm-tool --initialize)
     ├── status.py           # read-only
-    ├── setup.py            # read-only OTP-Anzeige
+    ├── setup.py            # OTP-Anzeige, RTC-Datetime, Dynamic Options (apdu_core.py)
     ├── pin.py              # PIN-Verwaltung (pkcs11-tool)
     ├── dkek.py             # DKEK-Shares, Key-Wrap/Unwrap (sc-hsm-tool)
-    ├── keys.py             # Objektverwaltung (python-pkcs11)
+    ├── keys.py             # Objektverwaltung (objects_core.py)
     ├── backup.py           # Backup/Restore/Drill/List (backup_core.py)
     └── firmware.py         # Preflight/Flash/Audit (flash_core.py)
 
 pico_hsm_tools/
 ├── flash_core.py         # EINZIGE Quelle der Wahrheit: Firmware-Update-Sicherheit
-├── pkcs11_session.py      # exklusive/read-only Sessions, Daemon-Konflikt-Erkennung
-├── daemon_status.py       # read-only Monitoring (Socket-Ping, Audit-Tail)
+├── pkcs11_session.py      # exklusive/read-only Sessions, Gateway-/Session-Konflikt-Check
+├── gateway_status.py       # read-only Monitoring (Gateway-Erreichbarkeit, Audit-Tail)
+├── pin_core.py            # EINZIGE Quelle der Wahrheit: PIN-Verwaltung (pkcs11-tool)
+├── dkek_core.py           # EINZIGE Quelle der Wahrheit: DKEK Wrap/Unwrap/Status (sc-hsm-tool)
+├── objects_core.py        # EINZIGE Quelle der Wahrheit: Objekt-Lifecycle (keys.*)
+├── apdu_core.py           # EINZIGE Quelle der Wahrheit: Vendor-APDUs (RTC, Dynamic Options)
 ├── backup_core.py          # Backup/Restore/Drill (age + ssss als Subprozesse)
 ├── age_bech32.py            # Bech32 encode/decode (BIP-173) für age-Identity-Strings
 └── backup_index.py        # scannt Backup-Verzeichnisse für `backup list`
+
+gui/  (Schritt 5: Skeleton; alle 7 Tabs ausgebaut, siehe GUI-Stand)
+├── app.py                # QApplication-Einstieg (Dark-Default), `pico-hsm-gui`
+├── config.py             # qconfig-Einstellungen (~/.pico_hsm/gui.json)
+├── main_window.py        # FluentWindow, Sidebar (1 Bereich pro CLI-Gruppe)
+├── workers.py            # QRunnable-Wrapper (lange Ops nie im UI-Thread)
+├── session_helpers.py    # MessageBox-Dialoge + Session-Opener (Qt-Pendant zu pkcs11_helpers.py)
+└── tabs/                 # alle 7 Tabs ausgebaut (status/setup/pin/dkek/keys/backup/firmware)
 ```
+
+### GUI-Stand (Phase-1-GUI komplett)
+
+Start via `pico-hsm-gui` (PySide6 + QFluentWidgets, Dark-Default mit
+Umschalter in der Sidebar). Die Sidebar spiegelt die CLI-Gruppen (Status,
+Setup, PIN, DKEK, Schlüssel, Backup, Firmware) — Status-, Setup-,
+PIN-, DKEK-, Schlüssel- und Backup-Tab sind ausgebaut (Backup inkl.
+Split/Restore/Drill/Liste), der Firmware-Tab ebenfalls (Preflight,
+geführtes Flashen mit TOTP-Dialog, Audit-Tabelle) — **alle 7 Tabs
+ausgebaut, Phase-1-GUI komplett**. Hinweis: QFluentWidgets steht unter GPLv3
+(bei Weitergabe der App beachten).
 
 ### Sicherheitsmodell in Kürze
 
@@ -216,8 +274,16 @@ pico_hsm_tools/
   rohen 32-Byte-Identity-Keys. Ciphertext-Prüfsumme vor, Plaintext-
   Prüfsumme nach dem Restore geprüft — Manipulation oder falsche Shares
   werden erkannt, bevor eine unvertrauenswürdige Datei zurückgegeben wird.
-- **Daemon-Konflikt**: jede schreibende Operation (`pin`, `dkek`, `keys`,
-  `init`) prüft vorab, ob `pico-hsm-daemon` erreichbar ist.
+- **Gateway-/Session-Konflikt**: rein informativer TCP-Check gegen das
+  HSM-Gateway plus gezielte Behandlung der PKCS#11-Fehlerklassen, die
+  beim tatsächlichen Öffnen einer schreibenden Session auf einen
+  belegten Reader hindeuten (aktuell `keys delete`, künftig alle
+  `objects_core.py`-Operationen — siehe `pkcs11_session.py`). Die
+  subprozessbasierten Befehle `pin`/`init` öffnen keine eigene
+  PKCS#11-Session; dort gibt es stattdessen nur den reinen Vorab-Hinweis
+  (`warn_if_gateway_reachable`) — ob wirklich ein Konflikt vorliegt,
+  zeigt dort letztlich der Exit-Code des externen Tools (`sc-hsm-tool`/
+  `pkcs11-tool`).
 
 ---
 

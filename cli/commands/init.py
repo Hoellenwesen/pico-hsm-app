@@ -5,19 +5,8 @@ from getpass import getpass
 
 import click
 
-from pico_hsm_tools.pkcs11_session import check_daemon_running
-
 from ..context import CliContext, pass_ctx
-
-
-def _check_daemon_guard(ctx: CliContext) -> None:
-    state = check_daemon_running()
-    if state.running and not ctx.force:
-        if not ctx.confirm(
-            f"pico-hsm-daemon läuft (Socket {state.socket_path}) — "
-            "paralleler Zugriff ist unsafe. Trotzdem fortfahren?"
-        ):
-            ctx.fail("Abgebrochen: Daemon-Konflikt nicht bestätigt.")
+from ..pkcs11_helpers import warn_if_gateway_reachable
 
 
 @click.group()
@@ -68,14 +57,14 @@ def token(
     Shares geladen sind (siehe `dkek status`).
     """
     ctx.echo(
-        "⚠ ACHTUNG: Diese Operation löscht ALLE vorhandenen Keys, "
+        "[WARN] ACHTUNG: Diese Operation löscht ALLE vorhandenen Keys, "
         "Zertifikate und Dateien auf dem Token unwiderruflich."
     )
     if not ctx.confirm("Wirklich initialisieren?"):
         ctx.fail("Abgebrochen.")
         return
 
-    _check_daemon_guard(ctx)
+    warn_if_gateway_reachable(ctx)
 
     import os
     so_pin = os.environ.get(so_pin_env) if so_pin_env else None
@@ -107,7 +96,7 @@ def token(
         return
 
     ctx.emit_json({"status": "ok", "dkek_shares": dkek_shares})
-    ctx.echo("✓ Token initialisiert.")
+    ctx.echo("[OK] Token initialisiert.")
     if dkek_shares:
         ctx.echo(
             f"  {dkek_shares} DKEK-Share(s) konfiguriert — jetzt "

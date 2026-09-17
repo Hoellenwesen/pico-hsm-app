@@ -4,6 +4,8 @@ import subprocess
 
 import click
 
+from pico_hsm_tools import dkek_core as dc
+
 from ..context import CliContext, pass_ctx
 
 
@@ -52,7 +54,7 @@ def create_share(ctx: CliContext, share_file: str, threshold: int | None, total:
     if result.returncode != 0:
         ctx.fail("create-dkek-share fehlgeschlagen.", exit_code=2)
         return
-    ctx.echo(f"✓ DKEK-Share nach {share_file} geschrieben.")
+    ctx.echo(f"[OK] DKEK-Share nach {share_file} geschrieben.")
 
 
 @dkek.command("import-share")
@@ -76,7 +78,7 @@ def import_share(ctx: CliContext, share_file: str, total: int | None) -> None:
     if result.returncode != 0:
         ctx.fail("import-dkek-share fehlgeschlagen.", exit_code=2)
         return
-    ctx.echo(f"✓ DKEK-Share aus {share_file} importiert.")
+    ctx.echo(f"[OK] DKEK-Share aus {share_file} importiert.")
 
 
 @dkek.command("wrap-key")
@@ -87,19 +89,12 @@ def wrap_key(ctx: CliContext, out_file: str, key_reference: int) -> None:
     """Einzelnen Private Key mit dem DKEK wrappen/exportieren (Key-Backup)."""
     pin = ctx.get_pin()
     try:
-        result = subprocess.run(
-            ["sc-hsm-tool", "--wrap-key", out_file,
-             "--key-reference", str(key_reference), "--pin", pin],
-            capture_output=True, text=True, timeout=30,
-        )
-    except FileNotFoundError:
-        ctx.fail("sc-hsm-tool nicht gefunden (Teil von OpenSC).")
-        return
-    if result.returncode != 0:
-        ctx.fail(result.stderr.strip() or "wrap-key fehlgeschlagen.", exit_code=2)
+        dc.wrap_key(out_file, key_reference, pin)
+    except dc.DkekError as exc:
+        ctx.fail(str(exc), exit_code=2)
         return
     ctx.emit_json({"status": "ok", "out_file": out_file, "key_reference": key_reference})
-    ctx.echo(f"✓ Key {key_reference} nach {out_file} exportiert (DKEK-verschlüsselt).")
+    ctx.echo(f"[OK] Key {key_reference} nach {out_file} exportiert (DKEK-verschlüsselt).")
 
 
 @dkek.command("unwrap-key")
@@ -112,19 +107,12 @@ def unwrap_key(ctx: CliContext, wrapped_file: str, key_reference: int) -> None:
     `keys import` — das ist der reale Import-Mechanismus von Pico HSM."""
     pin = ctx.get_pin()
     try:
-        result = subprocess.run(
-            ["sc-hsm-tool", "--unwrap-key", wrapped_file,
-             "--key-reference", str(key_reference), "--pin", pin],
-            capture_output=True, text=True, timeout=30,
-        )
-    except FileNotFoundError:
-        ctx.fail("sc-hsm-tool nicht gefunden (Teil von OpenSC).")
-        return
-    if result.returncode != 0:
-        ctx.fail(result.stderr.strip() or "unwrap-key fehlgeschlagen.", exit_code=2)
+        dc.unwrap_key(wrapped_file, key_reference, pin)
+    except dc.DkekError as exc:
+        ctx.fail(str(exc), exit_code=2)
         return
     ctx.emit_json({"status": "ok", "key_reference": key_reference})
-    ctx.echo(f"✓ Key erfolgreich als Reference {key_reference} importiert.")
+    ctx.echo(f"[OK] Key erfolgreich als Reference {key_reference} importiert.")
 
 
 @dkek.command("status")
@@ -137,14 +125,9 @@ def status_cmd(ctx: CliContext) -> None:
     query the status of a SmartCard-HSM").
     """
     try:
-        result = subprocess.run(
-            ["sc-hsm-tool"], capture_output=True, text=True, timeout=15,
-        )
-    except FileNotFoundError:
-        ctx.fail("sc-hsm-tool nicht gefunden (Teil von OpenSC).")
+        output = dc.dkek_status()
+    except dc.DkekError as exc:
+        ctx.fail(str(exc), exit_code=2)
         return
-    if result.returncode != 0:
-        ctx.fail(result.stderr.strip() or "Status-Abfrage fehlgeschlagen.", exit_code=2)
-        return
-    ctx.emit_json({"raw_output": result.stdout.strip()})
-    ctx.echo(result.stdout.strip())
+    ctx.emit_json({"raw_output": output})
+    ctx.echo(output)

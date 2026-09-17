@@ -1,39 +1,192 @@
 from __future__ import annotations
 
-import subprocess
+from datetime import datetime
 
 import click
 
+from pico_hsm_tools import apdu_core as ac
 from pico_hsm_tools import flash_core as fc
 
 from ..context import CliContext, pass_ctx
 
-OTP_FLAG_FIELDS = [
-    ("OTP_DATA_BOOT_FLAGS0.ROLLBACK_REQUIRED", "anti_rollback_active"),
-    ("OTP_DATA_CRIT1.DEBUG_DISABLE", "swd_debug_locked"),
-    ("OTP_DATA_CRIT1.SECURE_DEBUG_DISABLE", "secure_debug_locked"),
-    ("DEFAULT_BOOT_VERSION0", "current_rollback_counter"),
-]
-
-
-def _otp_get(field: str) -> str:
-    try:
-        result = subprocess.run(
-            ["picotool", "otp", "get", field],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode != 0:
-            return f"nicht lesbar ({result.stderr.strip() or 'kein Board?'})"
-        return result.stdout.strip()
-    except FileNotFoundError:
-        return "picotool nicht gefunden"
-    except subprocess.TimeoutExpired:
-        return "Timeout beim Lesen"
-
 
 @click.group()
 def setup() -> None:
-    """Read-only Anzeige der OTP-Konfiguration (Secure Boot etc.)."""
+    """OTP-Anzeige, RTC-Datetime und Dynamic Options (teils read-only)."""
+
+
+def _apdu_connection() -> ac.CardConnectionLike:
+    """APDU-Verbindung öffnen. Fehler -> ApduError (UI-Schicht mappt)."""
+    return ac.open_connection()
+
+
+@setup.group("datetime")
+def datetime_grp() -> None:
+    """RTC-Datetime lesen/schreiben (Vendor-APDU, siehe apdu_core.py)."""
+
+
+@datetime_grp.command("get")
+@pass_ctx
+def datetime_get(ctx: CliContext) -> None:
+    """Aktuelles RTC-Datetime des Tokens anzeigen (ISO-Format)."""
+    try:
+        conn = _apdu_connection()
+        try:
+            value = ac.get_datetime(conn)
+        finally:
+            conn.disconnect()
+    except ac.ApduError as exc:
+        ctx.fail(str(exc), exit_code=2)
+        return
+    ctx.emit_json({"datetime": value.isoformat(timespec="seconds")})
+    ctx.echo(f"RTC-Datetime: {value.strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+@datetime_grp.command("set")
+@click.argument("iso_datetime", required=False, default=None)
+@click.option(
+    "--now", is_flag=True,
+    help="Host-Zeit übernehmen statt ISO-Argument (Format JJJJ-MM-TTTHH:MM:SS).",
+)
+@pass_ctx
+def datetime_set(
+    ctx: CliContext, iso_datetime: str | None, now: bool,
+) -> None:
+    """RTC-Datetime setzen — Argument oder --now.
+
+    Beispiel: pico-hsm-cli setup datetime set 2026-09-16T12:00:00
+    Der Wochentag wird aus dem Datum berechnet, nicht übernommen.
+    Hinweis: Nach Reset/Stromverlust fällt die RTC auf 2020-01-01
+    zurück (Firmware-Verhalten, siehe extra_command.md).
+    """
+    if now:
+        value = datetime.now().replace(microsecond=0)
+    elif iso_datetime:
+        try:
+            value = datetime.fromisoformat(iso_datetime)
+        except ValueError:
+            ctx.fail(
+                "Ungültiges Format — erwartet ISO (JJJJ-MM-TTTHH:MM:SS) "
+                "oder --now.",
+                exit_code=1,
+            )
+            return
+    else:
+        ctx.fail("Argument ISO-DATETIME oder --now angeben.", exit_code=1)
+        return
+    try:
+        conn = _apdu_connection()
+        try:
+            ac.set_datetime(conn, value)
+        finally:
+            conn.disconnect()
+    except ac.ApduError as exc:
+        ctx.fail(str(exc), exit_code=2)
+        return
+    ctx.emit_json({"datetime": value.isoformat(timespec="seconds")})
+    ctx.echo(f"[OK] RTC-Datetime gesetzt: {value.strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+@setup.group("dynamic-options")
+def dynopts_grp() -> None:
+    """Dynamic Options lesen/schreiben (Vendor-APDU, siehe apdu_core.py)."""
+
+
+def _echo_dynopts(ctx: CliContext, options: ac.DynamicOptions) -> None:
+    ctx.emit_json({
+        "press_to_confirm": options.press_to_confirm,
+        "key_usage_counter": options.key_usage_counter,
+    })
+    ctx.echo(
+        f"Press-to-Confirm:   {'an' if options.press_to_confirm else 'aus'}\n"
+        f"Key-Usage-Counter:  {'an' if options.key_usage_counter else 'aus'}"
+    )
+
+
+@dynopts_grp.command("get")
+@pass_ctx
+def dynopts_get(ctx: CliContext) -> None:
+    """Aktuelle Dynamic Options anzeigen."""
+    try:
+        conn = _apdu_connection()
+        try:
+            options = ac.get_dynamic_options(conn)
+        finally:
+            conn.disconnect()
+    except ac.ApduError as exc:
+        ctx.fail(str(exc), exit_code=2)
+        return
+    _echo_dynopts(ctx, options)
+
+
+@dynopts_grp.command("set")
+@click.option(
+    "--press-to-confirm/--no-press-to-confirm", default=None,
+    help="Tasten-Bestätigung bei privatem/geheimem Key-Gebrauch.",
+)
+@click.option(
+    "--key-usage-counter/--no-key-usage-counter", default=None,
+    help="Nutzungszähler für alle Keys (neue Keys starten bei 2^32-1).",
+)
+@pass_ctx
+def dynopts_set(
+    ctx: CliContext,
+    press_to_confirm: bool | None,
+    key_usage_counter: bool | None,
+) -> None:
+    """Dynamic Options setzen — mindestens eine Option angeben.
+
+    Sicherheitsauflage (Architekturkonzept §9): Das DEAKTIVIEREN von
+    Press-to-Confirm braucht eine explizite Bestätigung (außer --force),
+    nicht nur das Aktivieren.
+    """
+    if press_to_confirm is None and key_usage_counter is None:
+        ctx.fail(
+            "Mindestens eine Option angeben "
+            "(--press-to-confirm/--no-press-to-confirm, "
+            "--key-usage-counter/--no-key-usage-counter).",
+            exit_code=1,
+        )
+        return
+    try:
+        conn = _apdu_connection()
+        try:
+            current = ac.get_dynamic_options(conn)
+        finally:
+            conn.disconnect()
+    except ac.ApduError as exc:
+        ctx.fail(str(exc), exit_code=2)
+        return
+    target = ac.DynamicOptions(
+        press_to_confirm=(
+            press_to_confirm
+            if press_to_confirm is not None
+            else current.press_to_confirm
+        ),
+        key_usage_counter=(
+            key_usage_counter
+            if key_usage_counter is not None
+            else current.key_usage_counter
+        ),
+    )
+    if current.press_to_confirm and not target.press_to_confirm:
+        if not ctx.confirm(
+            "Press-to-Confirm DEAKTIVIEREN? Danach bestätigt das Token "
+            "private/geheime Key-Operationen ohne Tastendruck."
+        ):
+            ctx.fail("Abgebrochen — nichts geändert.", exit_code=1)
+            return
+    try:
+        conn = _apdu_connection()
+        try:
+            ac.set_dynamic_options(conn, target)
+        finally:
+            conn.disconnect()
+    except ac.ApduError as exc:
+        ctx.fail(str(exc), exit_code=2)
+        return
+    ctx.echo("[OK] Dynamic Options gesetzt:")
+    _echo_dynopts(ctx, target)
 
 
 @setup.command("show")
@@ -58,8 +211,8 @@ def show(ctx: CliContext) -> None:
     except fc.FlashError as exc:
         payload["pubkey_fingerprint"] = f"nicht lesbar ({exc})"
 
-    for field, key in OTP_FLAG_FIELDS:
-        payload[key] = _otp_get(field)
+    for field, key in fc.OTP_FLAG_FIELDS:
+        payload[key] = fc.read_otp_field(field)
 
     ctx.emit_json(payload)
     for key, value in payload.items():
