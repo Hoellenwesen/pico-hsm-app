@@ -1,10 +1,11 @@
 """
 test_gui_status_tab.py — Status-Tab-Tests ohne Display und ohne Hardware.
 
-Core (get_token, get_status_snapshot) und Config-Speicherung werden
-gemockt; der FunctionWorker läuft echt im Thread-Pool (Muster für
-Schritt 6). Getestet: Aufbau, Config-Laden/Speichern, alle drei
-Sektionen, Fehler-InfoBars, Limit, Refresh-bei-Tab-Wechsel.
+Core (get_token, list_tokens, read_pin_flags, audit_chain_intact) und
+Config-Speicherung werden gemockt; der FunctionWorker läuft echt im
+Thread-Pool. Getestet: Aufbau, Token-Auswahl, beide Sektionen (Gerät,
+PIN-Status), Empfehlungen, Fehler-InfoBars, Auto-Refresh,
+Refresh-bei-Tab-Wechsel.
 """
 
 from __future__ import annotations
@@ -21,56 +22,73 @@ from qfluentwidgets import InfoBar
 from gui import config as gui_config
 from gui.main_window import MainWindow
 from gui.tabs import status_tab as status_mod
-from pico_hsm_tools import gateway_status
-from pico_hsm_tools.pkcs11_session import GatewayState
+from pico_hsm_tools import audit_log
 
 
-def _entries():
-    return [
-        gateway_status.AuditEntry("2026-09-01T10:00:00", "flashed", {"v": "1"}),
-        gateway_status.AuditEntry("2026-09-02T11:00:00", "flashed", {"v": "2"}),
-    ]
-
-
-def _snapshot(host="gw", port=8443, reachable=True, intact=True, entries=None):
-    # Mirrors real semantics: no address -> never reachable.
-    if not host or not port:
-        reachable = False
-    return gateway_status.StatusSnapshot(
-        gateway=GatewayState(reachable=reachable, host=host, port=port),
-        audit_chain_intact=intact,
-        recent_flash_events=_entries() if entries is None else entries,
-    )
-
-
-def _install_mocks(monkeypatch, snapshot=None, token_error=None):
+def _install_mocks(monkeypatch, chain_intact=True, token_error=None,
+                   pin_flags=None, pin_error=None, tokens=None,
+                   setup_done=None, backup_infos=None):
     """Core + Config-Speicherung mocken. Gibt calls-Dict zurück."""
-    calls: dict = {"snapshots": [], "saves": 0}
+    calls: dict = {"saves": 0, "serials": [], "chains": 0}
 
-    def fake_token():
+    def fake_token(*args, **kwargs):
+        calls["serials"].append(kwargs.get("serial"))
         if token_error is not None:
             raise token_error
         return SimpleNamespace(label="MockToken", model="MockMod", serial="SN1")
 
-    def fake_snapshot(host=None, port=None, audit_limit=20):
-        calls["snapshots"].append((host, port, audit_limit))
-        return snapshot if snapshot is not None else _snapshot(host, port)
+    def fake_pin_flags(lib_path=None, serial=None):
+        if pin_error is not None:
+            raise pin_error
+        if pin_flags is not None:
+            return pin_flags
+        return {
+            "login_required": True,
+            "user_pin_initialized": True,
+            "user_pin_count_low": False,
+            "user_pin_final_try": False,
+            "user_pin_locked": False,
+            "user_pin_to_be_changed": False,
+        }
+
+    def fake_chain():
+        calls["chains"] += 1
+        return chain_intact
 
     def fake_save(path=None):
         calls["saves"] += 1
 
     monkeypatch.setattr(status_mod, "get_token", fake_token)
     monkeypatch.setattr(
-        gateway_status, "get_status_snapshot", fake_snapshot,
+        status_mod.backup_index, "list_backups",
+        lambda parent_dir: (
+            backup_infos if backup_infos is not None else []
+        ),
     )
+    from gui.tabs import wizard_tab as wiz_mod
+
+    monkeypatch.setattr(
+        wiz_mod, "load_state",
+        lambda serial=None: (
+            setup_done if setup_done is not None
+            else {k: True for k in wiz_mod.STEP_KEYS}
+        ),
+    )
+    monkeypatch.setattr(status_mod, "list_tokens", lambda *a, **k: (
+        tokens if tokens is not None else [
+            {"label": "MockToken", "model": "MockMod", "serial": "SN1"},
+            {"label": "ZweitToken", "model": "MockMod", "serial": "SN2"},
+        ]
+    ))
+    monkeypatch.setattr(status_mod.pc, "read_pin_flags", fake_pin_flags)
+    monkeypatch.setattr(audit_log, "audit_chain_intact", fake_chain)
     monkeypatch.setattr(gui_config, "save_config", fake_save)
     return calls
 
 
 def _make_tab(qtbot, monkeypatch, **kwargs):
     calls = _install_mocks(monkeypatch, **kwargs)
-    monkeypatch.setattr(gui_config.cfg.gatewayHost, "value", "")
-    monkeypatch.setattr(gui_config.cfg.gatewayPort, "value", 0)
+    monkeypatch.setattr(gui_config.cfg.tokenSerial, "value", "")
     tab = status_mod.StatusTab()
     qtbot.addWidget(tab)
     tab.show()
@@ -82,22 +100,23 @@ def _make_tab(qtbot, monkeypatch, **kwargs):
 def test_builds_with_all_sections(qtbot, monkeypatch):
     tab, _ = _make_tab(qtbot, monkeypatch)
     for name in (
-        "deviceLabel", "gatewayHostEdit", "gatewayPortSpin", "refreshButton",
-        "gatewayResultLabel", "auditChainLabel", "auditTable", "auditLimitSpin",
+        "deviceLabel", "tokenCombo", "pinFlagsTable", "refreshButton",
     ):
         assert tab.findChild(object, name) is not None, name
-    assert tab.auditTable.columnCount() == 3
+    assert tab.findChild(object, "gatewayHostEdit") is None
+    assert tab.pinFlagsTable.columnCount() == 2
+    # Trennlinien zwischen den drei Sektionen:
+    from qfluentwidgets import HorizontalSeparator
+    assert len(tab.findChildren(HorizontalSeparator)) == 2
 
 
-def test_fields_load_from_config(qtbot, monkeypatch):
+def test_token_selection_loads_from_config(qtbot, monkeypatch):
     _install_mocks(monkeypatch)
-    monkeypatch.setattr(gui_config.cfg.gatewayHost, "value", "gw.test")
-    monkeypatch.setattr(gui_config.cfg.gatewayPort, "value", 8443)
+    monkeypatch.setattr(gui_config.cfg.tokenSerial, "value", "SN2")
     tab = status_mod.StatusTab()
     qtbot.addWidget(tab)
     try:
-        assert tab.gatewayHostEdit.text() == "gw.test"
-        assert tab.gatewayPortSpin.value() == 8443
+        assert tab.tokenCombo.currentData() == "SN2"
     finally:
         tab.close()
 
@@ -107,47 +126,15 @@ def test_fields_load_from_config(qtbot, monkeypatch):
 def test_refresh_fills_all_sections(qtbot, monkeypatch):
     tab, calls = _make_tab(qtbot, monkeypatch)
     try:
-        tab.gatewayHostEdit.setText("gw.test")
-        tab.gatewayPortSpin.setValue(8443)
         qtbot.mouseClick(tab.refreshButton, Qt.LeftButton)
         qtbot.waitUntil(
             lambda: tab.deviceLabel.text() != "Noch nicht abgefragt.",
             timeout=5000,
         )
         assert "MockToken" in tab.deviceLabel.text()
-        assert "erreichbar" in tab.gatewayResultLabel.text()
-        assert "intakt" in tab.auditChainLabel.text()
-        assert tab.auditTable.rowCount() == 2
         assert calls["saves"] == 1
-        assert calls["snapshots"] == [("gw.test", 8443, 20)]
-    finally:
-        tab.close()
-
-
-def test_refresh_without_gateway_address(qtbot, monkeypatch):
-    tab, calls = _make_tab(qtbot, monkeypatch)
-    try:
-        tab.refresh()
-        qtbot.waitUntil(
-            lambda: tab.deviceLabel.text() != "Noch nicht abgefragt.",
-            timeout=5000,
-        )
-        assert calls["snapshots"] == [(None, None, 20)]
-        assert "Gateway-Adresse konfiguriert" in tab.gatewayResultLabel.text()
-    finally:
-        tab.close()
-
-
-def test_refresh_limit_controls_snapshot(qtbot, monkeypatch):
-    tab, calls = _make_tab(qtbot, monkeypatch)
-    try:
-        tab.auditLimitSpin.setValue(5)
-        tab.refresh()
-        qtbot.waitUntil(
-            lambda: tab.deviceLabel.text() != "Noch nicht abgefragt.",
-            timeout=5000,
-        )
-        assert calls["snapshots"][-1][2] == 5
+        assert calls["chains"] == 1
+        assert tab.pinFlagsTable.rowCount() == 6
     finally:
         tab.close()
 
@@ -163,31 +150,72 @@ def test_device_failure_blocks_nothing(qtbot, monkeypatch):
             timeout=5000,
         )
         assert tab.deviceLabel.text() == "Nicht erkannt."
-        assert "Gateway-Adresse konfiguriert" in tab.gatewayResultLabel.text()
-        assert tab.auditTable.rowCount() == 2
     finally:
         tab.close()
 
 
-def test_broken_chain_and_empty_log(qtbot, monkeypatch):
+def test_token_selection_passes_serial(qtbot, monkeypatch):
+    tab, calls = _make_tab(qtbot, monkeypatch)
+    try:
+        tab.refresh()
+        qtbot.waitUntil(
+            lambda: tab.deviceLabel.text() != "Noch nicht abgefragt.",
+            timeout=5000,
+        )
+        assert tab.tokenCombo.count() == 3  # Automatisch + 2 Tokens
+        assert calls["serials"] == [None]
+        tab.tokenCombo.setCurrentIndex(2)
+        tab.refresh()
+        qtbot.waitUntil(lambda: calls["serials"] == [None, "SN2"], timeout=5000)
+    finally:
+        tab.close()
+
+
+def test_pin_flags_critical_warns(qtbot, monkeypatch):
     tab, _ = _make_tab(
         qtbot, monkeypatch,
-        snapshot=_snapshot(intact=False, entries=[]),
+        pin_flags={
+            "login_required": True,
+            "user_pin_initialized": True,
+            "user_pin_count_low": False,
+            "user_pin_final_try": False,
+            "user_pin_locked": True,
+            "user_pin_to_be_changed": False,
+        },
     )
     try:
         tab.refresh()
         qtbot.waitUntil(
-            lambda: "GEBROCHEN" in tab.auditChainLabel.text(),
+            lambda: tab.pinFlagsTable.rowCount() == 6,
             timeout=5000,
         )
-        assert tab.auditTable.rowCount() == 0
         qtbot.waitUntil(
             lambda: bool(tab.findChildren(InfoBar)),
             timeout=5000,
         )
+        texts = "\n".join(
+            bar.titleLabel.text() + " " + bar.contentLabel.text()
+            for bar in tab.findChildren(InfoBar)
+        )
+        assert "gesperrt" in texts
     finally:
         tab.close()
 
+
+def test_pin_flags_failure_blocks_nothing(qtbot, monkeypatch):
+    tab, _ = _make_tab(
+        qtbot, monkeypatch, pin_error=RuntimeError("kein Board"),
+    )
+    try:
+        tab.refresh()
+        qtbot.waitUntil(
+            lambda: tab.deviceLabel.text() != "Noch nicht abgefragt.",
+            timeout=5000,
+        )
+        assert tab.pinFlagsTable.rowCount() == 0
+        assert "MockToken" in tab.deviceLabel.text()
+    finally:
+        tab.close()
 
 def test_refresh_button_disabled_during_run(qtbot, monkeypatch):
     tab, _ = _make_tab(qtbot, monkeypatch)
@@ -198,6 +226,125 @@ def test_refresh_button_disabled_during_run(qtbot, monkeypatch):
     finally:
         tab.close()
 
+
+# --- Auto-Refresh (60s, nur sichtbar, kein Doppel-Lauf, kein Blinken) ---------
+
+def test_auto_timer_runs_only_when_visible(qtbot, monkeypatch):
+    tab, _ = _make_tab(qtbot, monkeypatch)
+    try:
+        assert tab._auto_timer.interval() == 60_000
+        assert tab._auto_timer.isActive()
+        tab.hide()
+        assert not tab._auto_timer.isActive()
+        tab.show()
+        assert tab._auto_timer.isActive()
+    finally:
+        tab.close()
+
+
+def test_refresh_ignores_second_call_while_busy(qtbot, monkeypatch):
+    tab, calls = _make_tab(qtbot, monkeypatch)
+    try:
+        tab._worker = object()  # simulierter laufender Worker
+        tab.refresh()
+        tab.refresh(auto=True)
+        qtbot.wait(300)
+        assert calls["serials"] == []
+    finally:
+        tab._worker = None
+        tab.close()
+
+
+def test_auto_refresh_dedupes_unchanged_errors(qtbot, monkeypatch):
+    tab, _ = _make_tab(
+        qtbot, monkeypatch, token_error=RuntimeError("kein Board"),
+    )
+    try:
+        tab.refresh(auto=True)
+        qtbot.waitUntil(
+            lambda: bool(tab.findChildren(InfoBar)),
+            timeout=5000,
+        )
+        assert len(tab.findChildren(InfoBar)) == 1
+        tab.refresh(auto=True)
+        qtbot.waitUntil(tab.refreshButton.isEnabled, timeout=5000)
+        qtbot.wait(300)
+        # Unveränderte Lage: Bars bleiben stehen, keine Duplikate.
+        assert len(tab.findChildren(InfoBar)) == 1
+    finally:
+        tab.close()
+
+
+# --- Empfehlungen (Dashboard) ---------------------------------------------------------
+
+def test_recommendations_empty_when_all_good(qtbot, monkeypatch):
+    tab, _ = _make_tab(qtbot, monkeypatch)
+    try:
+        tab.refresh()
+        qtbot.waitUntil(
+            lambda: tab.deviceLabel.text() != "Noch nicht abgefragt.",
+            timeout=5000,
+        )
+        qtbot.waitUntil(
+            lambda: tab.findChild(object, "recoEmptyLabel") is not None,
+            timeout=5000,
+        )
+    finally:
+        tab.close()
+
+
+def test_recommendations_jump_to_pin(qtbot, monkeypatch):
+    tab, _ = _make_tab(
+        qtbot, monkeypatch,
+        pin_flags={
+            "login_required": True,
+            "user_pin_initialized": True,
+            "user_pin_count_low": False,
+            "user_pin_final_try": False,
+            "user_pin_locked": True,
+            "user_pin_to_be_changed": False,
+        },
+    )
+    try:
+        tab.refresh()
+        qtbot.waitUntil(
+            lambda: tab.findChild(object, "recoJump_pin") is not None,
+            timeout=5000,
+        )
+        jumps: list = []
+        monkeypatch.setattr(
+            tab, "window", lambda: SimpleNamespace(show_tab=jumps.append),
+        )
+        qtbot.mouseClick(tab.findChild(object, "recoJump_pin"), Qt.LeftButton)
+        assert jumps == ["pin"]
+    finally:
+        tab.close()
+
+
+def test_recommendations_include_setup_and_backup(qtbot, monkeypatch):
+    from pico_hsm_tools import backup_index as bi_mod
+
+    infos = [
+        SimpleNamespace(
+            problems=["Ciphertext-Datei fehlt"],
+            leftover_shares_file_present=False,
+            drill_state="nie", drill_age_days=None, age_days=5,
+            last_drill_at=None, last_drill_result=None,
+        ),
+    ]
+    tab, _ = _make_tab(
+        qtbot, monkeypatch, setup_done={"detect": True, "init": False},
+        backup_infos=infos,
+    )
+    try:
+        tab.refresh()
+        qtbot.waitUntil(
+            lambda: tab.findChild(object, "recoJump_wizard") is not None,
+            timeout=5000,
+        )
+        assert tab.findChild(object, "recoJump_backup") is not None
+    finally:
+        tab.close()
 
 # --- Tab-Wechsel -------------------------------------------------------------------
 
@@ -210,8 +357,7 @@ def test_switch_to_status_triggers_refresh(qtbot, monkeypatch):
     Zwischen-Tab für alle Switch-Tests.
     """
     calls = _install_mocks(monkeypatch)
-    monkeypatch.setattr(gui_config.cfg.gatewayHost, "value", "")
-    monkeypatch.setattr(gui_config.cfg.gatewayPort, "value", 0)
+    monkeypatch.setattr(gui_config.cfg.tokenSerial, "value", "")
     window = MainWindow()
     qtbot.addWidget(window)
     window.show()

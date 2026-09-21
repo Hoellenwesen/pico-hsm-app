@@ -106,10 +106,12 @@ def _install_mocks(monkeypatch):
 
 def _make_tab(qtbot, monkeypatch):
     calls = _install_mocks(monkeypatch)
+    from gui.pin_vault import vault
+
+    vault.unlock("1234")
     tab = keys_mod.KeysTab()
     qtbot.addWidget(tab)
     tab.show()
-    tab.pinEdit.setText("1234")
     return tab, calls
 
 
@@ -126,7 +128,7 @@ def test_builds_with_all_widgets_and_defaults(qtbot, monkeypatch):
     tab, _ = _make_tab(qtbot, monkeypatch)
     try:
         for name in (
-            "pinEdit", "objectsTable", "keysRefreshButton", "deleteButton",
+            "pinStateLabel", "objectsTable", "keysRefreshButton", "deleteButton",
             "gotoDkekButton", "genTypeCombo", "genBitsCombo", "genCurveCombo",
             "genIdEdit", "genLabelEdit", "generateButton", "slowWarningLabel",
             "generateProgress", "aesBitsCombo", "aesIdEdit", "aesLabelEdit",
@@ -139,17 +141,34 @@ def test_builds_with_all_widgets_and_defaults(qtbot, monkeypatch):
         assert tab.privateCheck.isChecked() is True
         assert tab.genBitsCombo.currentText() == "2048"
         assert tab.randomSpin.maximum() == oc.MAX_RANDOM_BYTES
-        assert tab.pinEdit.viewButton.isHidden()
+        assert "Entsperrt" in tab.pinStateLabel.text()
     finally:
         tab.close()
 
 
-def test_pin_cleared_on_hide(qtbot, monkeypatch):
+def test_pin_state_label_when_locked(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
+    calls = _install_mocks(monkeypatch)
+    tab = keys_mod.KeysTab()
+    qtbot.addWidget(tab)
+    tab.show()
+    try:
+        vault.lock()
+        tab.show()
+        assert "Gesperrt" in tab.pinStateLabel.text()
+    finally:
+        tab.close()
+
+
+def test_hide_keeps_vault_pin(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
     tab, _ = _make_tab(qtbot, monkeypatch)
     try:
-        assert tab.pinEdit.text() == "1234"
+        assert vault.get() == "1234"
         tab.hide()
-        assert tab.pinEdit.text() == ""
+        assert vault.get() == "1234"
     finally:
         tab.close()
 
@@ -170,13 +189,15 @@ def test_refresh_fills_table(qtbot, monkeypatch):
 
 
 def test_refresh_without_pin_aborts(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
     tab, calls = _make_tab(qtbot, monkeypatch)
     try:
-        tab.pinEdit.setText("")
+        vault.lock()
         tab.refresh()
         qtbot.wait(300)
         assert calls["lists"] == 0
-        assert "User-PIN" in _bar_texts(tab)
+        assert "Gesperrt" in _bar_texts(tab)
     finally:
         tab.close()
 
@@ -400,13 +421,15 @@ def test_goto_dkek_switches_tab(qtbot, monkeypatch):
 
 
 def test_switch_to_keys_triggers_refresh(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
     _install_mocks(monkeypatch)
+    vault.unlock("1234")
     window = MainWindow()
     qtbot.addWidget(window)
     window.show()
     try:
         keys_tab = window.tab("keys")
-        keys_tab.pinEdit.setText("1234")
         assert keys_tab.objectsTable.rowCount() == 0
         window.navigationInterface.widget("status").clicked.emit(True)
         qtbot.waitUntil(

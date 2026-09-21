@@ -100,7 +100,13 @@ def test_generate_aes_key_rejects_unsupported_length():
     session.generate_key.assert_not_called()
 
 
-# --- list_objects / delete_object (migrierte Logik) ----------------------
+# --- list_objects / delete_object --------------------------------------------
+# Hardware-Befund (Ersatzboard): ungefilterte get_objects()-Suche liefert
+# selbst angelegte Objekte NICHT zurück (nur PROFILE-Systemobjekt) —
+# Liste und Löschung arbeiten daher mit CLASS-Filtern (wie der
+# funktionierende Read-Pfad). Tests bilden genau das ab.
+# Display-Befund: seit Python 3.11 rendert str(IntEnum) die Zahl
+# (`ObjectClass.PRIVATE_KEY` -> "3") — _display_name mappt auf Namen.
 
 def _fake_object(label, id_=None, object_class="PRIVATE_KEY", key_type="RSA"):
     obj = MagicMock()
@@ -111,30 +117,142 @@ def _fake_object(label, id_=None, object_class="PRIVATE_KEY", key_type="RSA"):
     return obj
 
 
+def _objects_by_class(mapping):
+    """get_objects-Seiteneffekt: Antwort je CLASS-Filter (leere Suche
+    gibt NICHTS zurück — wie echte Hardware)."""
+    def side_effect(template=None):
+        if not template or Attribute.CLASS not in template:
+            return []
+        return list(mapping.get(template[Attribute.CLASS], []))
+
+    return side_effect
+
+
 def test_list_objects_maps_fields():
     session = MagicMock()
-    session.get_objects.return_value = [
-        _fake_object("key1", id_=b"\x01"),
-        _fake_object("data1", object_class="DATA", key_type=None),
-    ]
+    session.get_objects.side_effect = _objects_by_class({
+        ObjectClass.PRIVATE_KEY: [_fake_object("key1", id_=b"\x01")],
+        ObjectClass.DATA: [_fake_object(
+            "data1", object_class="DATA", key_type=None)],
+    })
     result = oc.list_objects(session)
-    assert result[0].label == "key1"
+    assert [o.label for o in result] == ["key1", "data1"]
     assert result[0].id == b"\x01"
     assert result[0].key_type == "RSA"
-    assert result[1].label == "data1"
     assert result[1].key_type is None
+
+
+def test_list_objects_never_searches_unfiltered():
+    """Regressionstest für den Hardware-Befund: keine leere Suche
+    (die auf echter Hardware selbst angelegte Objekte unterschlägt)."""
+    session = MagicMock()
+    session.get_objects.side_effect = _objects_by_class({})
+    oc.list_objects(session)
+    assert session.get_objects.call_count == len(oc._LIST_SEARCH_CLASSES)
+    for call in session.get_objects.call_args_list:
+        template = call.args[0]
+        assert Attribute.CLASS in template
+
+
+def test_list_objects_queries_all_classes():
+    session = MagicMock()
+    session.get_objects.side_effect = _objects_by_class({})
+    oc.list_objects(session)
+    queried = {
+        call.args[0][Attribute.CLASS]
+        for call in session.get_objects.call_args_list
+    }
+    assert queried == set(oc._LIST_SEARCH_CLASSES)
 
 
 def test_delete_object_found_and_not_found():
     session = MagicMock()
     target = _fake_object("todelete")
-    session.get_objects.return_value = [target]
+    session.get_objects.side_effect = _objects_by_class({
+        ObjectClass.PRIVATE_KEY: [target],
+    })
     assert oc.delete_object(session, "todelete") is True
     target.destroy.assert_called_once()
 
     session2 = MagicMock()
-    session2.get_objects.return_value = []
+    session2.get_objects.side_effect = _objects_by_class({})
     assert oc.delete_object(session2, "nichtda") is False
+
+
+def test_delete_object_finds_data_object():
+    """Der gemeldete Hardware-Fall (hwtest01): nur per CLASS+LABEL-Filter
+    sichtbar, nie per Listen-Vergleich."""
+    session = MagicMock()
+    target = _fake_object("hwtest01", object_class="DATA", key_type=None)
+    session.get_objects.side_effect = _objects_by_class({
+        ObjectClass.DATA: [target],
+    })
+    assert oc.delete_object(session, "hwtest01") is True
+    target.destroy.assert_called_once()
+    templates = [
+        call.args[0] for call in session.get_objects.call_args_list
+    ]
+    assert all(
+        t.get(Attribute.LABEL) == "hwtest01" for t in templates
+    )
+
+
+def test_delete_object_searches_classes_in_order():
+    session = MagicMock()
+    session.get_objects.side_effect = _objects_by_class({})
+    oc.delete_object(session, "x")
+    classes = [
+        call.args[0][Attribute.CLASS]
+        for call in session.get_objects.call_args_list
+    ]
+    assert classes == list(oc._DELETE_SEARCH_CLASSES)
+
+
+def test_list_shows_certificates():
+    """Hardware-Befund (Unwrap-Blockade durch fid ce01): Zertifikate
+    müssen sichtbar sein, sonst blockieren sie unsichtbar."""
+    session = MagicMock()
+    session.get_objects.side_effect = _objects_by_class({
+        ObjectClass.CERTIFICATE: [_fake_object(
+            "cert1", object_class="CERTIFICATE", key_type=None)],
+    })
+    result = oc.list_objects(session)
+    assert [o.label for o in result] == ["cert1"]
+    assert result[0].object_class == "CERTIFICATE"
+
+
+def test_delete_removes_certificate():
+    session = MagicMock()
+    target = _fake_object("cert1", object_class="CERTIFICATE", key_type=None)
+    session.get_objects.side_effect = _objects_by_class({
+        ObjectClass.CERTIFICATE: [target],
+    })
+    assert oc.delete_object(session, "cert1") is True
+    target.destroy.assert_called_once()
+
+
+def test_display_name_maps_enums_not_numbers():
+    """Seit Python 3.11: str(IntEnum) ist die Zahl — Anzeige braucht Namen."""
+    assert oc._display_name(ObjectClass.PRIVATE_KEY) == "PRIVATE_KEY"
+    assert oc._display_name(ObjectClass.PUBLIC_KEY) == "PUBLIC_KEY"
+    assert oc._display_name("DATA") == "DATA"
+    assert oc._display_name(None) == "None"
+
+
+def test_list_objects_shows_enum_names():
+    session = MagicMock()
+    key = MagicMock()
+    key.label = "k1"
+    key.id = b"\x01"
+    key.object_class = ObjectClass.PRIVATE_KEY
+    from pkcs11 import KeyType
+    key.key_type = KeyType.RSA
+    session.get_objects.side_effect = _objects_by_class({
+        ObjectClass.PRIVATE_KEY: [key],
+    })
+    result = oc.list_objects(session)
+    assert result[0].object_class == "PRIVATE_KEY"
+    assert result[0].key_type == "RSA"
 
 
 # --- Datenobjekte ----------------------------------------------------------
@@ -178,18 +296,6 @@ def test_read_data_object_found_and_not_found():
     session2.get_objects.return_value = []
     with pytest.raises(oc.ObjectsError, match="test1"):
         oc.read_data_object(session2, "test1")
-
-
-def test_delete_data_object_is_type_filtered():
-    session = MagicMock()
-    obj = MagicMock()
-    session.get_objects.return_value = [obj]
-    assert oc.delete_data_object(session, "test1") is True
-    obj.destroy.assert_called_once()
-    # Sicherstellen, dass wirklich nach CLASS=DATA gefiltert wurde,
-    # nicht generisch wie delete_object():
-    args, _ = session.get_objects.call_args
-    assert args[0][Attribute.CLASS] == ObjectClass.DATA
 
 
 # --- Zufallszahlen ----------------------------------------------------------

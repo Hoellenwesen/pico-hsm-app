@@ -29,8 +29,8 @@ class CliContext:
     force: bool = False
     verbose: bool = False
     pin_env: Optional[str] = None
-    gateway_host: Optional[str] = None
-    gateway_port: Optional[int] = None
+    serial: Optional[str] = None
+    reader: Optional[str] = None
     _pin_cache: Optional[str] = field(default=None, repr=False)
 
     def get_pin(self, prompt: str = "HSM User-PIN: ") -> str:

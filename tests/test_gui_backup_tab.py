@@ -2,9 +2,8 @@
 test_gui_backup_tab.py — Backup-Tab-Tests ohne Display und ohne Hardware.
 
 Core (backup_core/backup_index) und Dialoge werden gemockt, Worker
-laufen echt. Deckt ab: Aufbau (inkl. 3-von-5-Defaults), Split-Mapping
-+ Validierung, Restore-Share-Parsing + Feld-Leerung, Drill
-Selbsttest/echt (PASS/FAIL), Liste (inkl. Leftover-Warnung),
+laufen echt. Deckt ab: Aufbau, Split/Restore/Drill per Empfänger,
+Liste (inkl. Hygiene), HSM-Backup (Vollbackup/Benutzerdefiniert),
 Datei-Dialoge, Refresh-bei-Tab-Wechsel.
 """
 
@@ -15,7 +14,6 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from types import SimpleNamespace
-from pathlib import Path
 
 from PySide6.QtCore import Qt
 from qfluentwidgets import InfoBar
@@ -26,37 +24,33 @@ from pico_hsm_tools import backup_core as bc
 from pico_hsm_tools import backup_index
 
 
-def _install_mocks(monkeypatch, split_manifest=None, self_test_result=True,
+def _install_mocks(monkeypatch, split_manifest=None,
                    drill_result=True, split_error=None, list_infos=None):
     """Core + Dialoge mocken. Gibt calls-Dict zurück."""
     calls: dict = {
-        "splits": [], "restores": [], "self_tests": 0, "drills": [],
+        "splits": [], "restores": [], "drills": [],
         "lists": [],
     }
 
-    def fake_split(export_file, out_dir, threshold, total, identity_file):
+    def fake_split(export_file, out_dir, recipients):
         if split_error is not None:
             raise split_error
-        calls["splits"].append(
-            (export_file, out_dir, threshold, total, identity_file),
-        )
-        return split_manifest or {"pubkey": "age1mock"}
+        calls["splits"].append((export_file, out_dir, recipients))
+        return split_manifest or {"pubkey": "age1zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "mode": "recipients",
+                                  "recipients": list(recipients)}
 
-    def fake_restore(backup_dir, output_file, shares):
-        calls["restores"].append((backup_dir, output_file, shares))
+    def fake_restore(backup_dir, output_file, identity_file):
+        calls["restores"].append((backup_dir, output_file, identity_file))
         return {"status": "ok"}
 
-    def fake_self_test():
-        calls["self_tests"] += 1
-        return self_test_result
-
-    def fake_drill(backup_dir, shares):
-        calls["drills"].append((backup_dir, shares))
+    def fake_drill(backup_dir, identity_file):
+        calls["drills"].append((backup_dir, identity_file))
+        if not drill_result:
+            raise bc.BackupError("Drill fehlgeschlagen.")
         return drill_result
 
     monkeypatch.setattr(bc, "split_backup", fake_split)
     monkeypatch.setattr(bc, "restore_backup", fake_restore)
-    monkeypatch.setattr(bc, "self_test", fake_self_test)
     monkeypatch.setattr(bc, "real_drill", fake_drill)
     monkeypatch.setattr(
         backup_index, "list_backups",
@@ -97,6 +91,8 @@ def _backup_info(**kwargs):
         "threshold": 3, "total_shares": 5, "ciphertext_sha256": "ab12",
         "leftover_shares_file_present": False,
         "last_drill_at": None, "last_drill_result": None,
+        "age_days": None, "drill_age_days": None, "drill_state": "nie",
+        "problems": [],
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -108,136 +104,42 @@ def test_builds_with_defaults(qtbot, monkeypatch):
     tab, _ = _make_tab(qtbot, monkeypatch)
     try:
         for name in (
-            "splitFileEdit", "splitDirEdit", "thresholdSpin", "totalSpin",
-            "identityFileEdit", "splitButton", "splitResultLabel",
-            "restoreDirEdit", "restoreFileEdit", "restoreSharesEdit",
-            "restoreButton", "selfTestButton", "drillDirEdit",
-            "drillSharesEdit", "drillButton", "listDirEdit",
+            "hsmAllCheck", "hsmKeysCheck", "hsmDataCheck", "hsmOptionsCheck",
+            "hsmOutEdit", "hsmOutBrowseButton", "hsmRecipientsEdit",
+            "hsmBackupButton",
+            "hsmRestoreDirEdit", "hsmRestoreBrowseButton", "hsmForceCheck",
+            "hsmRestoreIdentityEdit", "hsmRestoreIdentityBrowseButton",
+            "hsmRestoreButton", "hsmResultLabel",
+            "listDirEdit", "listDirBrowseButton",
             "backupRefreshButton", "backupsTable",
         ):
             assert tab.findChild(object, name) is not None, name
-        assert tab.thresholdSpin.value() == 3
-        assert tab.totalSpin.value() == 5
-        assert tab.backupsTable.columnCount() == 5
+        assert tab.findChild(object, "splitButton") is None
+        assert tab.findChild(object, "restoreButton") is None
+        assert tab.findChild(object, "drillButton") is None
+        assert tab.backupsTable.columnCount() == 6
     finally:
         tab.close()
 
 
 # --- Splitten ----------------------------------------------------------------------
 
-def test_split_mapping_and_hint(qtbot, monkeypatch):
-    tab, calls = _make_tab(qtbot, monkeypatch)
-    try:
-        tab.splitFileEdit.setText("C:/tmp/secret.bin")
-        tab.splitDirEdit.setText("C:/tmp/backup")
-        qtbot.mouseClick(tab.splitButton, Qt.LeftButton)
-        qtbot.waitUntil(lambda: len(calls["splits"]) == 1, timeout=5000)
-        export_file, out_dir, m, n, identity = calls["splits"][0]
-        assert (export_file, out_dir, m, n, identity) == (
-            Path("C:/tmp/secret.bin"), Path("C:/tmp/backup"), 3, 5, None,
-        )
-        assert "age1mock" in tab.splitResultLabel.text()
-        assert "3-2-1" in tab.splitResultLabel.text()
-        assert "erstellt" in _bar_texts(tab)
-    finally:
-        tab.close()
 
 
-def test_split_rejects_bad_input(qtbot, monkeypatch):
-    tab, calls = _make_tab(qtbot, monkeypatch)
-    try:
-        qtbot.mouseClick(tab.splitButton, Qt.LeftButton)  # alles leer
-        qtbot.wait(300)
-        tab.thresholdSpin.setValue(5)
-        tab.totalSpin.setValue(3)
-        tab.splitFileEdit.setText("C:/tmp/secret.bin")
-        tab.splitDirEdit.setText("C:/tmp/backup")
-        qtbot.mouseClick(tab.splitButton, Qt.LeftButton)  # m > n
-        qtbot.wait(300)
-        assert calls["splits"] == []
-        assert "angeben" in _bar_texts(tab) or "größer" in _bar_texts(tab)
-    finally:
-        tab.close()
 
 
-def test_split_failure_shows_error(qtbot, monkeypatch):
-    tab, _ = _make_tab(
-        qtbot, monkeypatch, split_error=bc.BackupError("boom"),
-    )
-    try:
-        tab.splitFileEdit.setText("C:/tmp/secret.bin")
-        tab.splitDirEdit.setText("C:/tmp/backup")
-        qtbot.mouseClick(tab.splitButton, Qt.LeftButton)
-        qtbot.waitUntil(lambda: bool(tab.findChildren(InfoBar)), timeout=5000)
-        assert "boom" in _bar_texts(tab)
-    finally:
-        tab.close()
 
 
 # --- Wiederherstellen -------------------------------------------------------------------
 
-def test_restore_parses_and_clears_shares(qtbot, monkeypatch):
-    tab, calls = _make_tab(qtbot, monkeypatch)
-    try:
-        tab.restoreDirEdit.setText("C:/tmp/backup")
-        tab.restoreFileEdit.setText("C:/tmp/out.bin")
-        tab.restoreSharesEdit.setPlainText("  aaa:11\n\nbbb:22\n")
-        qtbot.mouseClick(tab.restoreButton, Qt.LeftButton)
-        qtbot.waitUntil(lambda: len(calls["restores"]) == 1, timeout=5000)
-        _, _, shares = calls["restores"][0]
-        assert shares == ["aaa:11", "bbb:22"]
-        assert tab.restoreSharesEdit.toPlainText() == ""
-        assert "Wiederhergestellt" in _bar_texts(tab)
-    finally:
-        tab.close()
 
 
-def test_restore_without_shares_aborts(qtbot, monkeypatch):
-    tab, calls = _make_tab(qtbot, monkeypatch)
-    try:
-        tab.restoreDirEdit.setText("C:/tmp/backup")
-        tab.restoreFileEdit.setText("C:/tmp/out.bin")
-        qtbot.mouseClick(tab.restoreButton, Qt.LeftButton)
-        qtbot.wait(300)
-        assert calls["restores"] == []
-        assert "Share" in _bar_texts(tab)
-    finally:
-        tab.close()
 
 
 # --- Drill -------------------------------------------------------------------------------
 
-def test_self_test_pass_and_fail(qtbot, monkeypatch):
-    tab, _ = _make_tab(qtbot, monkeypatch)
-    try:
-        qtbot.mouseClick(tab.selfTestButton, Qt.LeftButton)
-        qtbot.waitUntil(lambda: "bestanden" in _bar_texts(tab), timeout=5000)
-    finally:
-        tab.close()
 
 
-def test_self_test_fail_shows_error(qtbot, monkeypatch):
-    tab, _ = _make_tab(qtbot, monkeypatch, self_test_result=False)
-    try:
-        qtbot.mouseClick(tab.selfTestButton, Qt.LeftButton)
-        qtbot.waitUntil(lambda: "FEHLGESCHLAGEN" in _bar_texts(tab), timeout=5000)
-    finally:
-        tab.close()
-
-
-def test_real_drill_parses_and_clears(qtbot, monkeypatch):
-    tab, calls = _make_tab(qtbot, monkeypatch)
-    try:
-        tab.drillDirEdit.setText("C:/tmp/backup")
-        tab.drillSharesEdit.setPlainText("s1\ns2\ns3\n")
-        qtbot.mouseClick(tab.drillButton, Qt.LeftButton)
-        qtbot.waitUntil(lambda: len(calls["drills"]) == 1, timeout=5000)
-        _, shares = calls["drills"][0]
-        assert shares == ["s1", "s2", "s3"]
-        assert tab.drillSharesEdit.toPlainText() == ""
-        assert "bestanden" in _bar_texts(tab)
-    finally:
-        tab.close()
 
 
 # --- Liste -------------------------------------------------------------------------------
@@ -259,20 +161,205 @@ def test_list_fills_table_and_warns(qtbot, monkeypatch):
         tab.close()
 
 
+def test_list_hygiene_column_ok_and_warn(qtbot, monkeypatch):
+    fresh = _backup_info(
+        path="/backups/ok", created_at="2026-09-01",
+        age_days=5, drill_age_days=2, drill_state="frisch",
+        last_drill_at="2026-09-18", last_drill_result="PASS",
+    )
+    stale = _backup_info(
+        path="/backups/alt", age_days=120, drill_state="nie",
+        problems=["Ciphertext-Datei fehlt"],
+    )
+    tab, _ = _make_tab(qtbot, monkeypatch, list_infos=[fresh, stale])
+    try:
+        tab.listDirEdit.setText("C:/tmp")
+        tab.refresh()
+        qtbot.waitUntil(lambda: tab.backupsTable.rowCount() == 2, timeout=5000)
+        assert tab.backupsTable.item(0, 5).text() == "OK"
+        assert tab.backupsTable.item(1, 5).text().startswith("WARN")
+        assert "vor 5 Tagen" in tab.backupsTable.item(0, 1).text()
+        assert "Hygiene:" in _bar_texts(tab)
+    finally:
+        tab.close()
+
+
 def test_browse_buttons_fill_edits(qtbot, monkeypatch):
     tab, _ = _make_tab(qtbot, monkeypatch)
     try:
-        qtbot.mouseClick(tab.splitFileBrowseButton, Qt.LeftButton)
-        qtbot.mouseClick(tab.splitDirBrowseButton, Qt.LeftButton)
-        qtbot.mouseClick(tab.restoreFileBrowseButton, Qt.LeftButton)
+        qtbot.mouseClick(tab.hsmOutBrowseButton, Qt.LeftButton)
+        qtbot.mouseClick(tab.hsmRestoreBrowseButton, Qt.LeftButton)
+        qtbot.mouseClick(tab.hsmRestoreIdentityBrowseButton, Qt.LeftButton)
         qtbot.mouseClick(tab.listDirBrowseButton, Qt.LeftButton)
-        assert tab.splitFileEdit.text() == "C:/tmp/in.bin"
-        assert tab.splitDirEdit.text() == "C:/tmp/dir"
-        assert tab.restoreFileEdit.text() == "C:/tmp/out.bin"
+        assert tab.hsmOutEdit.text() == "C:/tmp/dir"
+        assert tab.hsmRestoreDirEdit.text() == "C:/tmp/dir"
+        assert tab.hsmRestoreIdentityEdit.text() == "C:/tmp/in.bin"
         assert tab.listDirEdit.text() == "C:/tmp/dir"
     finally:
         tab.close()
 
+
+# --- HSM-Backup (Vollbackup/Benutzerdefiniert) ----------------------------------------------
+
+def test_hsm_widgets_exist(qtbot, monkeypatch):
+    tab, _ = _make_tab(qtbot, monkeypatch)
+    try:
+        for name in (
+            "hsmAllCheck", "hsmKeysCheck", "hsmDataCheck", "hsmOptionsCheck",
+            "hsmOutEdit", "hsmOutBrowseButton",
+            "hsmBackupButton", "hsmRestoreDirEdit", "hsmRestoreBrowseButton",
+            "hsmForceCheck", "hsmRestoreIdentityEdit",
+            "hsmRestoreIdentityBrowseButton", "hsmRestoreButton",
+            "hsmResultLabel", "hsmRecipientsEdit",
+        ):
+            assert tab.findChild(object, name) is not None, name
+    finally:
+        tab.close()
+
+
+def test_hsm_master_checkbox_sync(qtbot, monkeypatch):
+    tab, _ = _make_tab(qtbot, monkeypatch)
+    try:
+        assert tab.hsmAllCheck.isChecked()
+        tab.hsmDataCheck.setChecked(False)
+        assert not tab.hsmAllCheck.isChecked()
+        assert tab._hsm_parts() == ["keys", "options"]
+        tab.hsmAllCheck.setChecked(True)
+        assert tab._hsm_parts() == ["keys", "data", "options"]
+    finally:
+        tab.close()
+
+
+def test_hsm_backup_flow(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
+    tab, calls = _make_tab(qtbot, monkeypatch)
+    try:
+        vault.unlock("1234")
+        monkeypatch.setattr(
+            backup_mod, "_do_hsm_backup",
+            lambda parts, out, pin, serial, recipients: calls.setdefault(
+                "hsm", []).append((parts, pin, recipients)) or {
+                    "parts": parts, "keys": ["k1"], "data": [],
+                    "pubkey": "age1rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
+        )
+        tab.hsmOutEdit.setText("C:/tmp/hsm")
+        tab.hsmRecipientsEdit.setPlainText("age1pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\n")
+        qtbot.mouseClick(tab.hsmBackupButton, Qt.LeftButton)
+        qtbot.waitUntil(
+            lambda: "HSM-Backup ok" in tab.hsmResultLabel.text(),
+            timeout=5000,
+        )
+        assert calls["hsm"][0][0] == ["keys", "data", "options"]
+        assert calls["hsm"][0][1] == "1234"
+        assert calls["hsm"][0][2] == ["age1pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"]
+    finally:
+        tab.close()
+
+
+def test_hsm_backup_locked_aborts(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
+    tab, _ = _make_tab(qtbot, monkeypatch)
+    try:
+        vault.lock()
+        tab.hsmOutEdit.setText("C:/tmp/hsm")
+        tab.hsmRecipientsEdit.setPlainText("age1pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\n")
+        qtbot.mouseClick(tab.hsmBackupButton, Qt.LeftButton)
+        qtbot.wait(300)
+        assert "Gesperrt" in _bar_texts(tab)
+    finally:
+        tab.close()
+
+
+def test_hsm_backup_custom_selection(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
+    tab, calls = _make_tab(qtbot, monkeypatch)
+    try:
+        vault.unlock("1234")
+        monkeypatch.setattr(
+            backup_mod, "_do_hsm_backup",
+            lambda parts, out, pin, serial, recipients: {
+                "parts": parts, "keys": [], "data": [], "pubkey": "x"},
+        )
+        tab.hsmKeysCheck.setChecked(False)
+        tab.hsmDataCheck.setChecked(False)
+        tab.hsmOutEdit.setText("C:/tmp/hsm")
+        tab.hsmRecipientsEdit.setPlainText("age1pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\n")
+        qtbot.mouseClick(tab.hsmBackupButton, Qt.LeftButton)
+        qtbot.waitUntil(
+            lambda: "HSM-Backup ok" in tab.hsmResultLabel.text(),
+            timeout=5000,
+        )
+        assert "options," in tab.hsmResultLabel.text()
+    finally:
+        tab.close()
+
+
+def test_hsm_backup_recipients_passthrough(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
+    tab, calls = _make_tab(qtbot, monkeypatch)
+    try:
+        vault.unlock("1234")
+        monkeypatch.setattr(
+            backup_mod, "_do_hsm_backup",
+            lambda parts, out, pin, serial, recipients: calls.setdefault(
+                "hsm2", []).append(recipients) or {
+                    "parts": parts,
+                    "keys": [], "data": [], "pubkey": "age1rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"},
+        )
+        tab.hsmOutEdit.setText("C:/tmp/hsm")
+        tab.hsmRecipientsEdit.setPlainText("age1pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp\nage1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\n")
+        qtbot.mouseClick(tab.hsmBackupButton, Qt.LeftButton)
+        qtbot.waitUntil(
+            lambda: "Empfänger" in tab.hsmResultLabel.text(),
+            timeout=5000,
+        )
+        assert calls["hsm2"] == [["age1pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp", "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"]]
+    finally:
+        tab.close()
+
+
+def test_hsm_restore_identity(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
+    tab, calls = _make_tab(qtbot, monkeypatch)
+    try:
+        vault.unlock("1234")
+        seen: dict = {}
+        monkeypatch.setattr(
+            backup_mod, "_do_hsm_restore",
+            lambda *a, **k: seen.update(identity=a[4]) or {
+                "report": {"keys": [], "data": [], "options": False},
+                "verification": {"missing_keys": [], "missing_data": [],
+                                 "options_ok": True}},
+        )
+        tab.hsmRestoreDirEdit.setText("C:/tmp/hsm")
+        tab.hsmRestoreIdentityEdit.setText("C:/tmp/id.txt")
+        qtbot.mouseClick(tab.hsmRestoreButton, Qt.LeftButton)
+        qtbot.waitUntil(
+            lambda: "Restore ok" in tab.hsmResultLabel.text(),
+            timeout=5000,
+        )
+        assert seen["identity"] == "C:/tmp/id.txt"
+    finally:
+        tab.close()
+
+
+def test_hsm_backup_requires_recipients(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
+    tab, calls = _make_tab(qtbot, monkeypatch)
+    try:
+        vault.unlock("1234")
+        tab.hsmOutEdit.setText("C:/tmp/hsm")
+        qtbot.mouseClick(tab.hsmBackupButton, Qt.LeftButton)
+        qtbot.wait(300)
+        assert "Empfänger" in _bar_texts(tab)
+    finally:
+        tab.close()
 
 # --- Tab-Wechsel -------------------------------------------------------------------------------
 

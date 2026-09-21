@@ -3,12 +3,11 @@ test_gui_skeleton.py — GUI-Skeleton-Tests ohne Display und ohne Hardware.
 
 Läuft immer im Offscreen-Modus (QT_QPA_PLATFORM=offscreen als Default
 am Modulstart — deterministisch, kein Display nötig). Deckt ab:
-Fenster-Aufbau, Sidebar-Navigation (7 Bereiche wie CLI-Gruppen),
-Dark-Default + Umschalter, Worker-Signale, Dialog-Helfer,
-Platzhalter-Texte.
+Fenster-Aufbau, Sidebar-Navigation (9 Bereiche: Start-Wizard, 7 CLI-Gruppen + Logs),
+Dark-Default + Umschalter, Worker-Signale, Dialog-Helfer.
 
 Was HIER NICHT getestet wird: echte Core-Verdrahtung der Tabs
-(Schritt 6) und Darstellung auf realem Display.
+(jeweiliges Tab-Testmodul) und Darstellung auf realem Display.
 """
 
 from __future__ import annotations
@@ -25,8 +24,9 @@ from gui import workers
 from gui.main_window import NAV_ITEMS, MainWindow
 from gui.session_helpers import confirm_destructive, show_conflict
 
-EXPECTED_ORDER = ["status", "setup", "pin", "dkek", "keys", "backup", "firmware"]
+EXPECTED_ORDER = ["wizard", "status", "setup", "pin", "dkek", "keys", "backup", "firmware", "logs"]
 EXPECTED_TITLES = {
+    "wizard": "Start",
     "status": "Status",
     "setup": "Setup",
     "pin": "PIN",
@@ -34,6 +34,7 @@ EXPECTED_TITLES = {
     "keys": "Schlüssel",
     "backup": "Backup",
     "firmware": "Firmware",
+    "logs": "Logs",
 }
 
 
@@ -44,7 +45,7 @@ def test_nav_items_cover_all_cli_groups_in_order():
     assert routes == EXPECTED_ORDER
 
 
-def test_main_window_builds_with_seven_tabs(qapp):
+def test_main_window_builds_with_all_tabs(qapp):
     window = MainWindow()
     try:
         assert window.windowTitle() == "Pico HSM"
@@ -78,7 +79,7 @@ def test_sidebar_switch_changes_page(qtbot, monkeypatch):
     Refreshs prüfen die jeweiligen Tab-Testmodule.
     """
     from gui.tabs import backup_tab, dkek_tab, firmware_tab, keys_tab
-    from gui.tabs import pin_tab, setup_tab, status_tab
+    from gui.tabs import logs_tab, pin_tab, setup_tab, status_tab, wizard_tab
 
     calls: list = []
 
@@ -87,7 +88,7 @@ def test_sidebar_switch_changes_page(qtbot, monkeypatch):
 
     for module in (
         status_tab, setup_tab, pin_tab, dkek_tab, keys_tab,
-        backup_tab, firmware_tab,
+        backup_tab, firmware_tab, logs_tab, wizard_tab,
     ):
         for attr in dir(module):
             cls = getattr(module, attr)
@@ -101,6 +102,13 @@ def test_sidebar_switch_changes_page(qtbot, monkeypatch):
     qtbot.addWidget(window)
     window.show()
     try:
+        # Zuerst weg vom Start-Tab (wizard): sonst löst dessen Klick
+        # keinen Seitenwechsel (kein refresh) aus.
+        window.navigationInterface.widget("status").clicked.emit(True)
+        qtbot.waitUntil(
+            lambda: window.stackedWidget.currentWidget() is window.tab("status"),
+            timeout=3000,
+        )
         for route in EXPECTED_ORDER:
             nav_widget = window.navigationInterface.widget(route)
             assert nav_widget is not None, route
@@ -111,13 +119,19 @@ def test_sidebar_switch_changes_page(qtbot, monkeypatch):
                 timeout=3000,
             )
         # Zurück auf status: löst dessen refresh() aus — danach hat jeder
-        # Tab genau einen Refresh gesehen (MainWindow-Muster).
+        # Tab mit refresh()-Methode mindestens einen Refresh gesehen
+        # (MainWindow-Muster; Tabs ohne refresh wie Firmware sind
+        # ausgenommen — reines Anzeige-Update nur per Button).
         window.navigationInterface.widget("status").clicked.emit(True)
         qtbot.waitUntil(
             lambda: window.stackedWidget.currentWidget() is window.tab("status"),
             timeout=3000,
         )
-        assert sorted(calls) == sorted(EXPECTED_ORDER)
+        expected = {
+            route for route in EXPECTED_ORDER
+            if callable(getattr(window.tab(route), "refresh", None))
+        }
+        assert set(calls) == expected
     finally:
         window.close()
 
@@ -140,8 +154,7 @@ def test_theme_toggle_item_switches_theme_without_page_change(qtbot):
 
 
 def test_no_placeholder_hints_remain(qapp):
-    """Alle Tabs sind ausgebaut (Phase 1 komplett) — kein Schritt-6-
-    Platzhalter-Hinweis mehr vorhanden."""
+    """Kein Bau-Schritt-Hinweis mehr in der UI (alle Tabs ausgebaut)."""
     window = MainWindow()
     try:
         for route in EXPECTED_ORDER:

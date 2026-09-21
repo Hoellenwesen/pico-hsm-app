@@ -1,77 +1,92 @@
 """
-apdu_core.py — Vendor-APDUs für RTC (Datetime) und Dynamic Options.
+apdu_core.py — Vendor-APDUs für Dynamic Options.
 
 EINZIGE Quelle der Wahrheit für rohe APDU-Operationen (analog zu
 flash_core.py/backup_core.py/objects_core.py) — sowohl
-cli/commands/setup.py als auch die künftige GUI (gui/tabs/setup_tab.py)
-importieren ausschließlich hieraus.
+cli/commands/setup.py als auch gui/tabs/setup_tab.py importieren
+ausschließlich hieraus.
 
-Abgedeckt sind die in pico-hsm/doc/extra_command.md dokumentierten
-Vendor-Kommandos (CLA=0x80, INS=0x64):
-  - Datetime lesen/schreiben (P1=0x0A, 8-Byte-Nutzdaten)
-  - Dynamic Options lesen/schreiben (P1=0x06, 1-Byte-Bitmaske)
+Abgedeckt: Dynamic Options lesen/schreiben (CLA=0x80, INS=0x64,
+P1=0x06) — Byte-Layout QUELLENVERIFIZIERT gegen
+pico-hsm/src/hsm/cmd_extras.c + sc_hsm.h (statt nur Doku):
+  - GET `80 64 06 00 02` -> 2-Byte-Antwort uint16-BE (nicht 1 Byte!).
+  - Bitlage im HIGH-Byte: 0x0100 = Press-to-Confirm
+    (HSM_OPT_BOOTSEL_BUTTON), 0x0200 = Key-Usage-Counter
+    (HSM_OPT_KEY_COUNTER_ALL).
+  - SET `80 64 06 00 01 <mask>` (Lc=01): Datenbyte wird HIGH-Byte,
+    Low-Byte bleibt erhalten — daher Bit0/Bit1 des Datenbytes wie in
+    extra_command.md dokumentiert (Beispiele verifiziert).
+
+WICHTIG, am Board gemessen: ALLE Vendor-Kommandos brauchen vorherigen
+PIN-Login (`isUserAuthenticated`, cmd_extras.c) — ohne Login antwortet
+die Karte SW=6982. Aufrufer loggen sich zuerst per PKCS#11 ein (oder
+nutzen eine eingeloggte Session-Umgebung); diese Schicht nimmt KEINE
+PIN entgegen.
+
+NICHT (mehr) enthalten: RTC-Datetime (P1=0x0A). `CMD_DATETIME` ist in
+der Firmware definiert, wird aber nirgends behandelt — die Karte
+antwortet `6A86` (am Board gemessen + quellverifiziert). Die Befehle
+wurden daher entfernt (getroffene Entscheidung); extra_command.md
+beschreibt hier Firmware-Fiktion (v6.6).
 
 Implementierung über pyscard (smartcard.CardConnection), NICHT über
 `opensc-tool -s` + Textparsing — das Projekt hat mit dem
 picotool-Textparsing bereits zwei reale Bugs eingefangen (siehe README,
 Abschnitt 5); dieselbe Fehlerklasse hier von vornherein vermeiden.
+GET-RESPONSE (`61 XX`) und Le-Korrektur (`6C XX`) werden behandelt —
+`61 01` auf ein Le=1-GET ist normale Antwort, kein Fehler.
 
 ZUGRIFFSREGEL (Architekturkonzept §7.b, getroffene Entscheidung):
 APDU-Kommandos laufen SEQUENZIELL und NIE parallel zu einer offenen
-PKCS#11-Session. Aufrufer (CLI/GUI) schließen eine etwaige
-PKCS#11-Session, BEVOR eine APDU-Verbindung geöffnet wird. Der
-OpenSC-Treiber-Sharing-Mode (SCARD_SHARE_SHARED) ist ohne echte Hardware
-nicht verifizierbar — daher der sichere Default statt eines
-parallelen Versuchs.
+PKCS#11-Session — mit EINER Ausnahme: dem vorausgehenden PIN-Login
+selbst (Session danach schließen, bevor APDUs laufen). Messung am
+Board (docs/15 Phase 2.8, hw-logs/17): zweite exklusive Session +
+APDU bei gehaltener Session funktionieren störungsfrei — PKCS#11
+kennt keinen OS-exklusiven Session-Lock; die Regel bleibt als
+sicherer Default, SessionConflictError als Sicherheitsnetz.
 
 OFFENE PUNKTE (Architekturkonzept §12, ehrlich markiert):
-  - Keine der Funktionen unten ist gegen echte Pico-HSM-Hardware
-    verifiziert (kein Board vorhanden) — extra_command.md demonstriert
-    alles über `opensc-tool -s`, nicht über pyscard.
-  - Das Dynamic-Options-GET (`80 64 06 00 01`, Le=1) ist NICHT in
-    extra_command.md dokumentiert (dort nur SET-Beispiele); es ist aus
-    dem Befehlsschema `8064XX00[YY][ZZZZ][RR]` analog zum
-    Datetime-GET abgeleitet und MUSS am echten Board verifiziert werden.
+  - Dynamic-Options-Voll-Roundtrip VERIFIZIERT (docs/15 Phase 2.1,
+    hw-logs/06: 0x00->0x02->0x03->0x00 mit exakten Masken). Offen nur
+    der P2C-Enforcement-Umfang: kein Tastendruck trotz aktivem P2C
+    beobachtet (kein ENABLE_EMULATION im Build) — ggf. Timing-Test
+    nachholen.
   - In extra_command.md steht beim Key-Usage-Counter-SET fälschlich
     `Sending: 80 64 06 00 01 01` (Copy-Paste aus dem
     Press-to-Confirm-Beispiel); der dokumentierte opensc-tool-String
     `806406000102` dekodiert zu `80 64 06 00 01 02` — LETZTERES ist
-    implementiert, siehe Kommentar bei _SET_DYNOPTS_MASK.
+    implementiert (konsistent mit High-Byte-Bitlage).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Optional, Protocol
 
 
-# --- Konstanten (extra_command.md) ---------------------------------------
+# --- Konstanten (cmd_extras.c + sc_hsm.h, extra_command.md) -----------------
 
 _CLA_VENDOR = 0x80
 _INS_CUSTOM = 0x64
 
-_P1_DATETIME = 0x0A  # RTC lesen/schreiben, 8-Byte-Nutzdaten
-_P1_DYNOPTS = 0x06  # Dynamic Options, 1-Byte-Bitmaske
+_P1_DYNOPTS = 0x06  # Dynamic Options (SET: Lc=01 + Maske; GET: Le=02)
 
-_LEN_DATETIME = 8
-_LEN_DYNOPTS = 1
+_LEN_DYNOPTS_SET = 1  # Lc für SET
+_LEN_DYNOPTS_GET = 2  # Le für GET (uint16-BE-Antwort!)
+
+_GET_RESPONSE_CLA = 0x00
+_GET_RESPONSE_INS = 0xC0
+_MAX_GET_RESPONSE_ROUNDS = 8  # Endlosschutz
 
 _SW_OK = (0x90, 0x00)
 
-# Dynamic-Options-Bitfeld (LSB-zählend, siehe extra_command.md):
-#   Bit 0 = Press-to-Confirm, Bit 1 = Key-Usage-Counter.
-_BIT_PRESS_TO_CONFIRM = 0x01
-_BIT_KEY_USAGE_COUNTER = 0x02
-
-# RTC-Plausibilitätsgrenzen (CLI-seitig; die Firmware-Epoche beginnt
-# 2020-01-01 nach Reset, Obergrenze ist eine reine Plausibilitätsgrenze).
-_MIN_YEAR = 2020
-_MAX_YEAR = 2099
-
-# Wochentag-Kodierung der Firmware: 00h = Sonntag ... 06h = Samstag.
-# Python: isoweekday() Mo=1..So=7  ->  Firmware-Wert = isoweekday() % 7.
-_SUNDAY_FIRMWARE = 0
+# Dynamic-Options-Bitfeld, HIGH-Byte des uint16 (sc_hsm.h):
+#   0x0100 (HSM_OPT_BOOTSEL_BUTTON) = Press-to-Confirm,
+#   0x0200 (HSM_OPT_KEY_COUNTER_ALL) = Key-Usage-Counter.
+# Das SET-Datenbyte landet im High-Byte (newopts[0] = data[0]) —
+# daher Bit0/Bit1 des Datenbytes wie in extra_command.md dokumentiert.
+_BIT_PRESS_TO_CONFIRM = 0x01  # Datenbyte-Bit 0 -> uint16-Bit 8
+_BIT_KEY_USAGE_COUNTER = 0x02  # Datenbyte-Bit 1 -> uint16-Bit 9
 
 
 # --- Fehler ---------------------------------------------------------------
@@ -107,6 +122,8 @@ class DynamicOptions:
     key_usage_counter: bool = False  # Bit 1
 
     def to_byte(self) -> int:
+        """Datenbyte für SET (`80 64 06 00 01 <mask>`) — landet im
+        High-Byte des uint16 (Firmware: newopts[0] = data[0])."""
         value = 0
         if self.press_to_confirm:
             value |= _BIT_PRESS_TO_CONFIRM
@@ -115,15 +132,20 @@ class DynamicOptions:
         return value
 
     @classmethod
-    def from_byte(cls, value: int) -> "DynamicOptions":
-        if not 0 <= value <= 0xFF:
-            raise ApduError(f"Options-Byte außerhalb 0x00..0xFF: {value:#04x}")
-        # Unbekannte Bits (> Bit 1) bewusst IGNORIEREN statt ablehnen:
-        # künftige Firmware-Versionen dürfen das Bitfeld erweitern, ohne
-        # dass diese App-Version das Lesen verweigert.
+    def from_response(cls, data: list[int]) -> "DynamicOptions":
+        """Aus 2-Byte-GET-Antwort (uint16-BE) parsen. Bits sitzen im
+        HIGH-Byte (data[0]); unbekannte Bits bewusst IGNORIEREN statt
+        ablehnen: künftige Firmware-Versionen dürfen das Bitfeld
+        erweitern, ohne dass diese App-Version das Lesen verweigert."""
+        if len(data) != _LEN_DYNOPTS_GET:
+            raise ApduError(
+                f"Options-Antwort hat {len(data)} statt "
+                f"{_LEN_DYNOPTS_GET} Byte."
+            )
+        high = data[0]
         return cls(
-            press_to_confirm=bool(value & _BIT_PRESS_TO_CONFIRM),
-            key_usage_counter=bool(value & _BIT_KEY_USAGE_COUNTER),
+            press_to_confirm=bool(high & _BIT_PRESS_TO_CONFIRM),
+            key_usage_counter=bool(high & _BIT_KEY_USAGE_COUNTER),
         )
 
 
@@ -136,89 +158,71 @@ def _check_sw(sw1: int, sw2: int, what: str) -> None:
         )
 
 
-def _transmit(
+def _raw_transmit(
     connection: CardConnectionLike, apdu: list[int], what: str,
-) -> list[int]:
+) -> tuple[list[int], int, int]:
+    """Einzelnes transmit mit Fehler-Wrapping (keine SW-Auswertung)."""
     try:
         response, sw1, sw2 = connection.transmit(apdu)
     except ApduError:
         raise
     except Exception as exc:  # noqa: BLE001 — PC/SC-Fehler wrappen
         raise ApduError(f"{what}: Übertragungsfehler ({exc})") from exc
+    return list(response), sw1, sw2
+
+
+def _transmit(
+    connection: CardConnectionLike, apdu: list[int], what: str,
+) -> list[int]:
+    """APDU senden mit Standard-Antwortbehandlung (ISO 7816):
+
+    - `90 00` -> Daten direkt zurück.
+    - `61 XX` -> GET RESPONSE (`00 C0 00 00 <XX>`, XX=0 heißt 256),
+      ggf. mehrmals, bis kein `61 XX` mehr kommt (Endlosschutz).
+    - `6C XX` (falsches Le, nur bei Le-tragenden APDUs der Länge 5) ->
+      genau einmal mit korrigiertem Le wiederholen.
+    - Sonst: ApduError mit SW.
+    """
+    response, sw1, sw2 = _raw_transmit(connection, apdu, what)
+    if sw1 == 0x6C and len(apdu) == 5:
+        response, sw1, sw2 = _raw_transmit(
+            connection, [*apdu[:-1], sw2], f"{what} (Le-Korrektur)",
+        )
+    data = list(response)
+    rounds = 0
+    while sw1 == 0x61:
+        rounds += 1
+        if rounds > _MAX_GET_RESPONSE_ROUNDS:
+            raise ApduError(
+                f"{what}: GET-RESPONSE-Endlosschutz "
+                f"(>{_MAX_GET_RESPONSE_ROUNDS} Runden)."
+            )
+        chunk, sw1, sw2 = _raw_transmit(
+            connection,
+            # Le-Byte 0x00 heißt 256 (kommt hier nur bei sw2 == 0 vor).
+            [_GET_RESPONSE_CLA, _GET_RESPONSE_INS, 0x00, 0x00, sw2],
+            f"{what} (GET RESPONSE)",
+        )
+        data.extend(chunk)
     _check_sw(sw1, sw2, what)
-    return list(response)
-
-
-def _encode_datetime(dt: datetime) -> list[int]:
-    if not _MIN_YEAR <= dt.year <= _MAX_YEAR:
-        raise ApduError(
-            f"Jahr {dt.year} außerhalb {_MIN_YEAR}..{_MAX_YEAR} "
-            "(Firmware-Epoche beginnt 2020)."
-        )
-    weekday = dt.isoweekday() % 7  # Mo=1..So=7 -> So=0..Sa=6
-    return [
-        (dt.year >> 8) & 0xFF, dt.year & 0xFF,  # Jahr, MSB zuerst
-        dt.month, dt.day, weekday,
-        dt.hour, dt.minute, dt.second,
-    ]
-
-
-def _decode_datetime(raw: list[int]) -> datetime:
-    if len(raw) != _LEN_DATETIME:
-        raise ApduError(
-            f"Datetime-Antwort hat {len(raw)} statt {_LEN_DATETIME} Byte."
-        )
-    year = (raw[0] << 8) | raw[1]
-    try:
-        return datetime(year, raw[2], raw[3], raw[5], raw[6], raw[7])
-    except ValueError as exc:
-        raise ApduError(f"Ungültige Datetime-Antwort ({exc}).") from exc
-    # Hinweis: raw[4] (Wochentag) wird bewusst nicht geprüft/übernommen —
-    # Python leitet den Wochentag aus dem Datum ab; ein abweichendes Byte
-    # wäre ein Firmware-Artefakt, kein Anwendungsfehler.
+    return data
 
 
 # --- Öffentliche API (Signaturen aus Architekturkonzept §7.b) ----------------
 
-def get_datetime(connection: CardConnectionLike) -> datetime:
-    """RTC-Datetime lesen. APDU (dokumentiert): `80 64 0A 00 08`."""
-    raw = _transmit(
-        connection, [_CLA_VENDOR, _INS_CUSTOM, _P1_DATETIME, 0x00, _LEN_DATETIME],
-        "Datetime lesen",
-    )
-    return _decode_datetime(raw)
-
-
-def set_datetime(connection: CardConnectionLike, dt: datetime) -> None:
-    """RTC-Datetime setzen. APDU (dokumentiert, Lc=08 + 8 Datenbytes).
-
-    Der Wochentag wird aus `dt` berechnet, nicht übernommen — Aufrufer
-    geben nur das Datum/die Uhrzeit an.
-    """
-    data = _encode_datetime(dt)
-    _transmit(
-        connection,
-        [_CLA_VENDOR, _INS_CUSTOM, _P1_DATETIME, 0x00, _LEN_DATETIME, *data],
-        "Datetime setzen",
-    )
-
-
 def get_dynamic_options(connection: CardConnectionLike) -> DynamicOptions:
-    """Dynamic Options lesen. APDU (`80 64 06 00 01`, Le=1).
+    """Dynamic Options lesen. APDU (`80 64 06 00 02`, Le=2).
 
-    [WARNUNG] NICHT hardwareverifiziert und NICHT in extra_command.md
-    dokumentiert (dort nur SET) — aus dem Befehlsschema analog zum
-    Datetime-GET abgeleitet. Am echten Board verifizieren (§12).
+    Antwort: 2 Bytes uint16-BE (put_uint16_be, cmd_extras.c) — Bits im
+    HIGH-Byte. VORAUSSETZUNG: vorheriger PIN-Login (sonst SW=6982,
+    am Board gemessen).
     """
     raw = _transmit(
-        connection, [_CLA_VENDOR, _INS_CUSTOM, _P1_DYNOPTS, 0x00, _LEN_DYNOPTS],
+        connection,
+        [_CLA_VENDOR, _INS_CUSTOM, _P1_DYNOPTS, 0x00, _LEN_DYNOPTS_GET],
         "Dynamic Options lesen",
     )
-    if len(raw) != _LEN_DYNOPTS:
-        raise ApduError(
-            f"Options-Antwort hat {len(raw)} statt {_LEN_DYNOPTS} Byte."
-        )
-    return DynamicOptions.from_byte(raw[0])
+    return DynamicOptions.from_response(raw)
 
 
 def set_dynamic_options(
@@ -234,12 +238,29 @@ def set_dynamic_options(
     mask = options.to_byte()
     _transmit(
         connection,
-        [_CLA_VENDOR, _INS_CUSTOM, _P1_DYNOPTS, 0x00, _LEN_DYNOPTS, mask],
+        [_CLA_VENDOR, _INS_CUSTOM, _P1_DYNOPTS, 0x00, _LEN_DYNOPTS_SET, mask],
         "Dynamic Options setzen",
     )
 
 
 # --- Verbindung (pyscard, lazy import) ---------------------------------------
+
+def list_readers() -> list[str]:
+    """PC/SC-Reader-Namen auflisten (ohne Karten-Probe, billig/pollbar).
+
+    Rein lesend — wirft ApduError bei fehlendem pyscard/PCSC-Dienst.
+    """
+    try:
+        from smartcard.System import readers  # type: ignore
+    except ImportError as exc:
+        raise ApduError(
+            "pyscard ist nicht installiert (pip install pyscard)."
+        ) from exc
+    try:
+        return [str(reader) for reader in readers()]
+    except Exception as exc:  # noqa: BLE001 — PC/SC-Dienstfehler
+        raise ApduError(f"PC/SC-Readerliste nicht lesbar ({exc}).") from exc
+
 
 def open_connection(reader: Optional[str] = None) -> Any:
     """PC/SC-Verbindung zum Pico HSM öffnen (pyscard).
@@ -257,9 +278,8 @@ def open_connection(reader: Optional[str] = None) -> Any:
         from smartcard.System import readers  # type: ignore
     except ImportError as exc:
         raise ApduError(
-            "pyscard ist nicht installiert — für `setup datetime` / "
-            "`setup dynamic-options` erforderlich "
-            "(pip install pyscard, siehe pyproject.toml)."
+            "pyscard ist nicht installiert — für `setup dynamic-options` "
+            "erforderlich (pip install pyscard, siehe pyproject.toml)."
         ) from exc
 
     try:
@@ -299,8 +319,8 @@ def open_connection(reader: Optional[str] = None) -> Any:
     except Exception as exc:  # noqa: BLE001 — inkl. Reader-belegt-Fall
         raise ApduError(
             f"Reader {chosen} nicht nutzbar ({exc}) — evtl. hält ein "
-            "anderer Prozess (z.B. eine offene PKCS#11-Session oder das "
-            "Gateway) den Reader belegt. APDU-Zugriff ist sequenziell/"
+            "anderer lokaler Prozess (z.B. eine offene PKCS#11-Session) "
+            "den Reader belegt. APDU-Zugriff ist sequenziell/"
             "exklusiv (§7.b)."
         ) from exc
     return connection

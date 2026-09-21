@@ -18,9 +18,9 @@ PIN-Wert (weder User- noch SO-PIN) — UI-Schichten dürfen exc-Texte
 daher frei anzeigen. Intern werden PINs nur als kurzlebige Locals
 gehalten, nie geloggt, nie persistiert.
 
-OFFENE PUNKTE (Architekturkonzept §12, ehrlich markiert): nichts
-PIN-spezifisch Neues — wie überall keine Hardware-Verifikation
-(kein Board vorhanden); die pkcs11-tool-Aufrufe sind 1:1 aus der
+HARDWARE-VERIFIKATION (§12, docs/15 Phase 2.6, hw-logs/13):
+PIN-Wechsel/Entsperr-Zyklus am Board ohne Fehlermeldung, neue PINs
+jeweils nutzbar. Die pkcs11-tool-Aufrufe unten sind 1:1 aus der
 bisherigen, manuell verifizierten CLI übernommen.
 """
 
@@ -42,11 +42,14 @@ class PinError(Exception):
 
 def _run_pkcs11_tool(
     args: list[str], lib_path: Optional[str] = None,
+    serial: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
     """pkcs11-tool aufrufen. FileNotFoundError -> PinError (klar)."""
     full_args = ["pkcs11-tool"]
     if lib_path:
         full_args += ["--module", lib_path]
+    if serial:
+        full_args += ["--serial", serial]
     full_args += args
     try:
         return subprocess.run(
@@ -61,11 +64,12 @@ def _run_pkcs11_tool(
 
 def change_user_pin(
     old_pin: str, new_pin: str, lib_path: Optional[str] = None,
+    serial: Optional[str] = None,
 ) -> None:
     """User-PIN ändern (--change-pin, braucht aktuelle User-PIN)."""
     result = _run_pkcs11_tool(
         ["--login", "--pin", old_pin, "--change-pin", "--new-pin", new_pin],
-        lib_path,
+        lib_path, serial,
     )
     if result.returncode != 0:
         raise PinError(
@@ -75,6 +79,7 @@ def change_user_pin(
 
 def unblock_user_pin(
     so_pin: str, new_pin: str, lib_path: Optional[str] = None,
+    serial: Optional[str] = None,
 ) -> None:
     """Gesperrte User-PIN mit SO-PIN zurücksetzen (--init-pin).
 
@@ -85,7 +90,7 @@ def unblock_user_pin(
     result = _run_pkcs11_tool(
         ["--login", "--login-type", "so", "--so-pin", so_pin,
          "--init-pin", "--new-pin", new_pin],
-        lib_path,
+        lib_path, serial,
     )
     if result.returncode != 0:
         raise PinError(
@@ -93,7 +98,9 @@ def unblock_user_pin(
         )
 
 
-def read_pin_flags(lib_path: Optional[str] = None) -> dict[str, bool]:
+def read_pin_flags(
+    lib_path: Optional[str] = None, serial: Optional[str] = None,
+) -> dict[str, bool]:
     """PIN-Status aus der TokenFlag-Bitmaske (read-only, kein Lock).
 
     Korrektur (aus pin.py übernommen): es gibt keine
@@ -101,7 +108,7 @@ def read_pin_flags(lib_path: Optional[str] = None) -> dict[str, bool]:
     token.flags.
     """
     try:
-        token = get_token(lib_path)
+        token = get_token(lib_path, serial=serial)
     except Exception as exc:  # noqa: BLE001 — Aufrufer mappen
         raise PinError(f"Kein Gerät erkannt: {exc}") from exc
     flags = token.flags

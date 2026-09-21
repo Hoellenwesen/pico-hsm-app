@@ -1,15 +1,13 @@
-"""backup_tab.py — Backup-Bereich (Schritt 6f: sechster ausgebauter Tab).
+"""backup_tab.py — Backup-Bereich.
 
-Alle vier CLI-Bereiche (`backup split/restore/drill/list`): Splitten
-(age+Shamir), Wiederherstellen, Drill (Selbsttest + echt), Backup-Liste.
-Core-Logik aus pico_hsm_tools/backup_core.py + backup_index.py (kein
-Core-Umbau nötig — reine Funktionen, keine Sessions, keine PINs).
+CLI-Bereiche (`backup list/hsm-backup/hsm-restore`): echtes HSM-Backup
+(Token-Inhalt: Keys per DKEK-Wrap, Datenobjekte, Optionen; Vollbackup
+oder benutzerdefiniert per Checkbox), versiegelt per Empfänger
+(age, 1-aus-n) — plus Backup-Liste mit Hygiene.
+Core-Logik aus backup_core.py + backup_index.py + hsm_backup.py (PIN aus
+Anmeldung/Vault, keine eigenen PIN-Felder).
 
-Getroffene Entscheidungen (Schritt 6f): ein Formular pro Bereich,
-Mehrzeilen-Share-Eingabe (ein Share pro Zeile), beide Drill-Arten,
-Schwelle/Gesamt-Default 3-von-5. Shares sind Secrets und werden nach
-erfolgreichem Restore/Drill aus den Feldern gelöscht (Hygiene wie
-PIN-Felder).
+Getroffene Entscheidung: ein Formular pro Bereich.
 """
 
 from __future__ import annotations
@@ -27,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import (
     BodyLabel,
-    CompactSpinBox,
+    CheckBox,
     InfoBar,
     InfoBarPosition,
     LineEdit,
@@ -40,8 +38,8 @@ from qfluentwidgets import (
 )
 
 from gui.workers import FunctionWorker
-from pico_hsm_tools import backup_core as bc
 from pico_hsm_tools import backup_index
+from pico_hsm_tools import hsm_backup as hb
 
 
 def _ask_open_file(parent: QWidget, caption: str) -> str | None:
@@ -67,8 +65,43 @@ def _parse_shares(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
+def _do_hsm_backup(parts: list[str], out_dir: str,
+                   pin: str, serial: str | None,
+                   recipients: list[str]) -> dict:
+    """HSM-Backup im Worker: Gate, Inventar, Export, Versiegelung."""
+    hb.check_dkek_ready()
+    inventory = hb.collect_inventory(pin, serial)
+    staging = Path(out_dir) / ".hsm-staging"
+    manifest = hb.export_parts(
+        inventory, parts, staging, pin, serial)
+    sealed = hb.seal_bundle(staging, Path(out_dir), recipients)
+    return {
+        "parts": parts,
+        "keys": [k["label"] for k in manifest.keys],
+        "data": [d["label"] for d in manifest.data_objects],
+        "pubkey": sealed.get("pubkey"),
+        "recipients": sealed.get("recipients", []),
+    }
+
+
+def _do_hsm_restore(backup_dir: str, pin: str,
+                    serial: str | None, force: bool,
+                    identity_file: str) -> dict:
+    """HSM-Restore im Worker: Öffnen, Anwenden, Verifizieren."""
+    import json
+
+    work = Path(backup_dir) / ".hsm-restore-work"
+    bundle_zip = hb.open_sealed_bundle(
+        Path(backup_dir), work, Path(identity_file))
+    report, manifest_dict = hb.apply_bundle(
+        bundle_zip, pin, serial, force=force)
+    manifest = hb.HsmManifest.from_dict(manifest_dict)
+    verification = hb.verify_against_manifest(manifest, pin, serial)
+    return {"report": report, "verification": verification}
+
+
 class BackupTab(QWidget):
-    """Backup-Tab: Splitten, Wiederherstellen, Drill, Liste."""
+    """Backup-Tab: HSM-Backup, HSM-Restore, Backup-Liste."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -79,127 +112,101 @@ class BackupTab(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(TitleLabel("Backup", self))
 
-        # --- Splitten ------------------------------------------------------
-        layout.addWidget(StrongBodyLabel("Backup splitten (age + Shamir)", self))
-        split_file_row = QHBoxLayout()
-        self.splitFileEdit = LineEdit(self)
-        self.splitFileEdit.setObjectName("splitFileEdit")
-        self.splitFileEdit.setPlaceholderText("Zu sichernde Datei")
-        self.splitFileBrowseButton = PushButton("Durchsuchen", self)
-        self.splitFileBrowseButton.setObjectName("splitFileBrowseButton")
-        self.splitFileBrowseButton.clicked.connect(self._on_split_file_browse)
-        split_file_row.addWidget(self.splitFileEdit, 1)
-        split_file_row.addWidget(self.splitFileBrowseButton)
-        layout.addLayout(split_file_row)
-        split_dir_row = QHBoxLayout()
-        self.splitDirEdit = LineEdit(self)
-        self.splitDirEdit.setObjectName("splitDirEdit")
-        self.splitDirEdit.setPlaceholderText("Zielordner für das Backup")
-        self.splitDirBrowseButton = PushButton("Durchsuchen", self)
-        self.splitDirBrowseButton.setObjectName("splitDirBrowseButton")
-        self.splitDirBrowseButton.clicked.connect(self._on_split_dir_browse)
-        split_dir_row.addWidget(self.splitDirEdit, 1)
-        split_dir_row.addWidget(self.splitDirBrowseButton)
-        layout.addLayout(split_dir_row)
-        split_param_row = QHBoxLayout()
-        self.thresholdSpin = CompactSpinBox(self)
-        self.thresholdSpin.setObjectName("thresholdSpin")
-        self.thresholdSpin.setRange(1, 255)
-        self.thresholdSpin.setValue(3)
-        self.thresholdSpin.setPrefix("m ")
-        self.totalSpin = CompactSpinBox(self)
-        self.totalSpin.setObjectName("totalSpin")
-        self.totalSpin.setRange(1, 255)
-        self.totalSpin.setValue(5)
-        self.identityFileEdit = LineEdit(self)
-        self.identityFileEdit.setObjectName("identityFileEdit")
-        self.identityFileEdit.setPlaceholderText(
-            "age-Identity-Datei (optional, leer = neues Keypair)"
-        )
-        self.identityBrowseButton = PushButton("Durchsuchen", self)
-        self.identityBrowseButton.setObjectName("identityBrowseButton")
-        self.identityBrowseButton.clicked.connect(self._on_identity_browse)
-        self.splitButton = PrimaryPushButton("Splitten", self)
-        self.splitButton.setObjectName("splitButton")
-        self.splitButton.clicked.connect(self._on_split)
-        split_param_row.addWidget(self.thresholdSpin)
-        split_param_row.addWidget(self.totalSpin)
-        split_param_row.addWidget(self.identityFileEdit, 1)
-        split_param_row.addWidget(self.identityBrowseButton)
-        split_param_row.addWidget(self.splitButton)
-        layout.addLayout(split_param_row)
-        self.splitResultLabel = BodyLabel("", self)
-        self.splitResultLabel.setObjectName("splitResultLabel")
-        self.splitResultLabel.setWordWrap(True)
-        layout.addWidget(self.splitResultLabel)
-
-        # --- Wiederherstellen --------------------------------------------------
-        layout.addWidget(StrongBodyLabel("Wiederherstellen", self))
-        restore_dir_row = QHBoxLayout()
-        self.restoreDirEdit = LineEdit(self)
-        self.restoreDirEdit.setObjectName("restoreDirEdit")
-        self.restoreDirEdit.setPlaceholderText("Backup-Ordner")
-        self.restoreDirBrowseButton = PushButton("Durchsuchen", self)
-        self.restoreDirBrowseButton.setObjectName("restoreDirBrowseButton")
-        self.restoreDirBrowseButton.clicked.connect(self._on_restore_dir_browse)
-        restore_dir_row.addWidget(self.restoreDirEdit, 1)
-        restore_dir_row.addWidget(self.restoreDirBrowseButton)
-        layout.addLayout(restore_dir_row)
-        restore_file_row = QHBoxLayout()
-        self.restoreFileEdit = LineEdit(self)
-        self.restoreFileEdit.setObjectName("restoreFileEdit")
-        self.restoreFileEdit.setPlaceholderText("Ausgabedatei")
-        self.restoreFileBrowseButton = PushButton("Durchsuchen", self)
-        self.restoreFileBrowseButton.setObjectName("restoreFileBrowseButton")
-        self.restoreFileBrowseButton.clicked.connect(self._on_restore_file_browse)
-        restore_file_row.addWidget(self.restoreFileEdit, 1)
-        restore_file_row.addWidget(self.restoreFileBrowseButton)
-        layout.addLayout(restore_file_row)
-        self.restoreSharesEdit = TextEdit(self)
-        self.restoreSharesEdit.setObjectName("restoreSharesEdit")
-        self.restoreSharesEdit.setPlaceholderText(
-            "Shares, ein Share pro Zeile (werden nach Erfolg gelöscht)"
-        )
-        self.restoreSharesEdit.setMaximumHeight(80)
-        layout.addWidget(self.restoreSharesEdit)
-        self.restoreButton = PrimaryPushButton("Wiederherstellen", self)
-        self.restoreButton.setObjectName("restoreButton")
-        self.restoreButton.clicked.connect(self._on_restore)
-        layout.addWidget(self.restoreButton)
-
-        # --- Drill ---------------------------------------------------------------
-        layout.addWidget(StrongBodyLabel("Recovery-Drill", self))
-        drill_self_row = QHBoxLayout()
-        drill_self_row.addWidget(BodyLabel(
-            "Automatisierter Selbsttest ohne echtes Backup.", self,
+        # --- HSM-Backup (Token-Inhalt) -------------------------------------
+        layout.addWidget(StrongBodyLabel("HSM-Backup (Token-Inhalt)", self))
+        layout.addWidget(BodyLabel(
+            "Sichert Keys (DKEK-Wrap), Datenobjekte und Optionen vom Token "
+            "für Restore auf neuer Hardware. Braucht DKEK mit Shares "
+            "(sonst Abbruch) und Anmeldung (PIN aus Vault). PINs, DKEK "
+            "und OTP migrieren nie.",
+            self,
         ))
-        drill_self_row.addStretch(1)
-        self.selfTestButton = PrimaryPushButton("Selbsttest", self)
-        self.selfTestButton.setObjectName("selfTestButton")
-        self.selfTestButton.clicked.connect(self._on_self_test)
-        drill_self_row.addWidget(self.selfTestButton)
-        layout.addLayout(drill_self_row)
-        drill_real_row = QHBoxLayout()
-        self.drillDirEdit = LineEdit(self)
-        self.drillDirEdit.setObjectName("drillDirEdit")
-        self.drillDirEdit.setPlaceholderText("Backup-Ordner für echten Drill")
-        self.drillDirBrowseButton = PushButton("Durchsuchen", self)
-        self.drillDirBrowseButton.setObjectName("drillDirBrowseButton")
-        self.drillDirBrowseButton.clicked.connect(self._on_drill_dir_browse)
-        drill_real_row.addWidget(self.drillDirEdit, 1)
-        drill_real_row.addWidget(self.drillDirBrowseButton)
-        layout.addLayout(drill_real_row)
-        self.drillSharesEdit = TextEdit(self)
-        self.drillSharesEdit.setObjectName("drillSharesEdit")
-        self.drillSharesEdit.setPlaceholderText(
-            "Shares, ein Share pro Zeile (werden nach Erfolg gelöscht)"
+        self.hsmAllCheck = CheckBox("Vollbackup (alle Teile)", self)
+        self.hsmAllCheck.setObjectName("hsmAllCheck")
+        self.hsmAllCheck.setChecked(True)
+        self.hsmAllCheck.stateChanged.connect(self._on_hsm_all_changed)
+        layout.addWidget(self.hsmAllCheck)
+        parts_row = QHBoxLayout()
+        self.hsmKeysCheck = CheckBox("Keys", self)
+        self.hsmKeysCheck.setObjectName("hsmKeysCheck")
+        self.hsmKeysCheck.setChecked(True)
+        self.hsmDataCheck = CheckBox("Datenobjekte", self)
+        self.hsmDataCheck.setObjectName("hsmDataCheck")
+        self.hsmDataCheck.setChecked(True)
+        self.hsmOptionsCheck = CheckBox("Optionen", self)
+        self.hsmOptionsCheck.setObjectName("hsmOptionsCheck")
+        self.hsmOptionsCheck.setChecked(True)
+        for check in (self.hsmKeysCheck, self.hsmDataCheck,
+                      self.hsmOptionsCheck):
+            check.stateChanged.connect(self._on_hsm_part_changed)
+            parts_row.addWidget(check)
+        parts_row.addStretch(1)
+        layout.addLayout(parts_row)
+        hsm_param_row = QHBoxLayout()
+        self.hsmOutEdit = LineEdit(self)
+        self.hsmOutEdit.setObjectName("hsmOutEdit")
+        self.hsmOutEdit.setPlaceholderText("Zielordner für das HSM-Backup")
+        self.hsmOutBrowseButton = PushButton("Durchsuchen", self)
+        self.hsmOutBrowseButton.setObjectName("hsmOutBrowseButton")
+        self.hsmOutBrowseButton.clicked.connect(self._on_hsm_out_browse)
+        self.hsmBackupButton = PrimaryPushButton("HSM-Backup erstellen", self)
+        self.hsmBackupButton.setObjectName("hsmBackupButton")
+        self.hsmBackupButton.clicked.connect(self._on_hsm_backup)
+        hsm_param_row.addWidget(self.hsmOutEdit, 1)
+        hsm_param_row.addWidget(self.hsmOutBrowseButton)
+        hsm_param_row.addWidget(self.hsmBackupButton)
+        layout.addLayout(hsm_param_row)
+        self.hsmRecipientsEdit = TextEdit(self)
+        self.hsmRecipientsEdit.setObjectName("hsmRecipientsEdit")
+        self.hsmRecipientsEdit.setPlaceholderText(
+            "Empfänger-Pubkeys, einer pro Zeile (Pflicht — 1-aus-n, "
+            "Format age1...; Keypaar: `age-keygen -o identity.txt`)"
         )
-        self.drillSharesEdit.setMaximumHeight(80)
-        layout.addWidget(self.drillSharesEdit)
-        self.drillButton = PrimaryPushButton("Echten Drill starten", self)
-        self.drillButton.setObjectName("drillButton")
-        self.drillButton.clicked.connect(self._on_real_drill)
-        layout.addWidget(self.drillButton)
+        self.hsmRecipientsEdit.setMaximumHeight(60)
+        layout.addWidget(self.hsmRecipientsEdit)
+        # --- HSM-Restore -------------------------------------------------
+        layout.addWidget(StrongBodyLabel("HSM-Restore (neue Hardware)", self))
+        layout.addWidget(BodyLabel(
+            "Voraussetzung: Token initialisiert + derselbe DKEK per Shares "
+            "importiert. Danach Unwrap, Daten, Optionen + Verifikation.",
+            self,
+        ))
+        hsm_restore_row = QHBoxLayout()
+        self.hsmRestoreDirEdit = LineEdit(self)
+        self.hsmRestoreDirEdit.setObjectName("hsmRestoreDirEdit")
+        self.hsmRestoreDirEdit.setPlaceholderText("HSM-Backup-Ordner")
+        self.hsmRestoreBrowseButton = PushButton("Durchsuchen", self)
+        self.hsmRestoreBrowseButton.setObjectName("hsmRestoreBrowseButton")
+        self.hsmRestoreBrowseButton.clicked.connect(
+            self._on_hsm_restore_browse)
+        self.hsmForceCheck = CheckBox("Belegte References überschreiben", self)
+        self.hsmForceCheck.setObjectName("hsmForceCheck")
+        hsm_restore_row.addWidget(self.hsmRestoreDirEdit, 1)
+        hsm_restore_row.addWidget(self.hsmRestoreBrowseButton)
+        hsm_restore_row.addWidget(self.hsmForceCheck)
+        layout.addLayout(hsm_restore_row)
+        hsm_restore_identity_row = QHBoxLayout()
+        self.hsmRestoreIdentityEdit = LineEdit(self)
+        self.hsmRestoreIdentityEdit.setObjectName("hsmRestoreIdentityEdit")
+        self.hsmRestoreIdentityEdit.setPlaceholderText(
+            "Identity-Datei eines Empfängers (Pflicht)"
+        )
+        self.hsmRestoreIdentityBrowseButton = PushButton("Durchsuchen", self)
+        self.hsmRestoreIdentityBrowseButton.setObjectName(
+            "hsmRestoreIdentityBrowseButton")
+        self.hsmRestoreIdentityBrowseButton.clicked.connect(
+            self._on_hsm_restore_identity_browse)
+        hsm_restore_identity_row.addWidget(self.hsmRestoreIdentityEdit, 1)
+        hsm_restore_identity_row.addWidget(self.hsmRestoreIdentityBrowseButton)
+        layout.addLayout(hsm_restore_identity_row)
+        self.hsmRestoreButton = PrimaryPushButton("HSM-Restore starten", self)
+        self.hsmRestoreButton.setObjectName("hsmRestoreButton")
+        self.hsmRestoreButton.clicked.connect(self._on_hsm_restore)
+        layout.addWidget(self.hsmRestoreButton)
+        self.hsmResultLabel = BodyLabel("", self)
+        self.hsmResultLabel.setObjectName("hsmResultLabel")
+        self.hsmResultLabel.setWordWrap(True)
+        layout.addWidget(self.hsmResultLabel)
 
         # --- Liste -----------------------------------------------------------------
         list_head = QHBoxLayout()
@@ -222,9 +229,9 @@ class BackupTab(QWidget):
         layout.addLayout(list_dir_row)
         self.backupsTable = TableWidget(self)
         self.backupsTable.setObjectName("backupsTable")
-        self.backupsTable.setColumnCount(5)
+        self.backupsTable.setColumnCount(6)
         self.backupsTable.setHorizontalHeaderLabels(
-            ["Pfad", "Erstellt", "Schema", "SHA", "Letzter Drill"],
+            ["Pfad", "Erstellt", "Schema", "SHA", "Letzter Drill", "Hygiene"],
         )
         self.backupsTable.setEditTriggers(TableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.backupsTable)
@@ -281,146 +288,150 @@ class BackupTab(QWidget):
 
     # --- Dateien -------------------------------------------------------------
 
-    def _on_split_file_browse(self) -> None:
-        path = _ask_open_file(self, "Zu sichernde Datei wählen")
-        if path:
-            self.splitFileEdit.setText(path)
 
-    def _on_split_dir_browse(self) -> None:
-        path = _ask_directory(self, "Zielordner wählen")
-        if path:
-            self.splitDirEdit.setText(path)
 
-    def _on_identity_browse(self) -> None:
-        path = _ask_open_file(self, "age-Identity-Datei wählen (optional)")
-        if path:
-            self.identityFileEdit.setText(path)
 
-    def _on_restore_dir_browse(self) -> None:
-        path = _ask_directory(self, "Backup-Ordner wählen")
-        if path:
-            self.restoreDirEdit.setText(path)
 
-    def _on_restore_file_browse(self) -> None:
-        path = _ask_save_file(self, "Ausgabedatei wählen")
-        if path:
-            self.restoreFileEdit.setText(path)
 
-    def _on_drill_dir_browse(self) -> None:
-        path = _ask_directory(self, "Backup-Ordner wählen")
-        if path:
-            self.drillDirEdit.setText(path)
 
     def _on_list_dir_browse(self) -> None:
         path = _ask_directory(self, "Eltern-Ordner wählen")
         if path:
             self.listDirEdit.setText(path)
 
-    # --- Splitten --------------------------------------------------------------
+    # --- HSM-Backup ------------------------------------------------------------
 
-    def _on_split(self) -> None:
-        export_file = self.splitFileEdit.text().strip()
-        out_dir = self.splitDirEdit.text().strip()
-        if not export_file or not out_dir:
-            self._show_error("Zu sichernde Datei und Zielordner angeben.")
+    def _vault_pin(self) -> str | None:
+        from gui.pin_vault import vault
+
+        pin = vault.get()
+        if not pin:
+            self._show_error("Gesperrt — bitte zuerst anmelden (Start-Tab).")
+            return None
+        return pin
+
+    def _selected_serial(self) -> str | None:
+        from gui.session_helpers import selected_serial
+
+        return selected_serial()
+
+    def _hsm_parts(self) -> list[str]:
+        parts = []
+        if self.hsmKeysCheck.isChecked():
+            parts.append("keys")
+        if self.hsmDataCheck.isChecked():
+            parts.append("data")
+        if self.hsmOptionsCheck.isChecked():
+            parts.append("options")
+        return parts
+
+    def _on_hsm_all_changed(self) -> None:
+        checked = self.hsmAllCheck.isChecked()
+        for check in (self.hsmKeysCheck, self.hsmDataCheck,
+                      self.hsmOptionsCheck):
+            check.blockSignals(True)
+            check.setChecked(checked)
+            check.blockSignals(False)
+
+    def _on_hsm_part_changed(self) -> None:
+        all_checked = all((
+            self.hsmKeysCheck.isChecked(), self.hsmDataCheck.isChecked(),
+            self.hsmOptionsCheck.isChecked(),
+        ))
+        self.hsmAllCheck.blockSignals(True)
+        self.hsmAllCheck.setChecked(all_checked)
+        self.hsmAllCheck.blockSignals(False)
+
+    def _on_hsm_out_browse(self) -> None:
+        path = _ask_directory(self, "Zielordner für das HSM-Backup wählen")
+        if path:
+            self.hsmOutEdit.setText(path)
+
+    def _on_hsm_restore_browse(self) -> None:
+        path = _ask_directory(self, "HSM-Backup-Ordner wählen")
+        if path:
+            self.hsmRestoreDirEdit.setText(path)
+
+    def _on_hsm_backup(self) -> None:
+        parts = self._hsm_parts()
+        if not parts:
+            self._show_error("Mindestens einen Teil wählen (oder Vollbackup).")
             return
-        threshold = self.thresholdSpin.value()
-        total = self.totalSpin.value()
-        if threshold > total:
+        out_dir = self.hsmOutEdit.text().strip()
+        if not out_dir:
+            self._show_error("Zielordner angeben.")
+            return
+        recipients = _parse_shares(self.hsmRecipientsEdit.toPlainText())
+        if not recipients:
             self._show_error(
-                f"Schwelle ({threshold}) darf nicht größer als Gesamtzahl "
-                f"({total}) sein."
-            )
+                "Empfänger-Pubkeys angeben (einer pro Zeile, 1-aus-n).")
             return
-        identity_text = self.identityFileEdit.text().strip()
-        identity_file = Path(identity_text) if identity_text else None
-
-        def make() -> FunctionWorker:
-            def split():
-                return bc.split_backup(
-                    Path(export_file), Path(out_dir),
-                    threshold, total, identity_file,
-                )
-
-            return FunctionWorker(split)
-
-        def done(manifest: dict) -> None:
-            self.splitResultLabel.setText(
-                f"Public Key: {manifest.get('pubkey', '?')} — "
-                "'shares-DO-NOT-KEEP-TOGETHER.txt' nach lokalem Drill "
-                "löschen und Einzel-Shares an getrennte Orte verteilen (3-2-1)."
-            )
-            self._show_success(
-                f"Backup erstellt ({threshold}-von-{total})."
-            )
-
-        self._start_worker(make, done, self.splitButton)
-
-    # --- Wiederherstellen ----------------------------------------------------------
-
-    def _on_restore(self) -> None:
-        backup_dir = self.restoreDirEdit.text().strip()
-        output_file = self.restoreFileEdit.text().strip()
-        shares = _parse_shares(self.restoreSharesEdit.toPlainText())
-        if not backup_dir or not output_file:
-            self._show_error("Backup-Ordner und Ausgabedatei angeben.")
-            return
-        if not shares:
-            self._show_error("Mindestens ein Share eingeben.")
+        pin = self._vault_pin()
+        if not pin:
             return
 
         def make() -> FunctionWorker:
-            def restore():
-                return bc.restore_backup(
-                    Path(backup_dir), Path(output_file), shares,
-                )
+            return FunctionWorker(
+                _do_hsm_backup, parts, out_dir, pin,
+                self._selected_serial(), recipients,
+            )
 
-            return FunctionWorker(restore)
+        def done(result: dict) -> None:
+            keys = ", ".join(result["keys"]) or "—"
+            data = ", ".join(result["data"]) or "—"
+            self.hsmResultLabel.setText(
+                f"HSM-Backup ok ({', '.join(result['parts'])}, "
+                f"{len(recipients)} Empfänger, 1-aus-n). "
+                f"Keys: {keys}. Daten: {data}. Datei an alle "
+                "Standorte verteilen!"
+            )
+            self._show_success("HSM-Backup erstellt und versiegelt.")
 
-        def done(_manifest: dict) -> None:
-            self.restoreSharesEdit.setPlainText("")
-            self._show_success(f"Wiederhergestellt nach {output_file}.")
+        self._start_worker(make, done, self.hsmBackupButton)
 
-        self._start_worker(make, done, self.restoreButton)
+    def _on_hsm_restore(self) -> None:
+        backup_dir = self.hsmRestoreDirEdit.text().strip()
+        identity_text = self.hsmRestoreIdentityEdit.text().strip()
+        if not backup_dir or not identity_text:
+            self._show_error(
+                "Backup-Ordner und Identity-Datei angeben.")
+            return
+        pin = self._vault_pin()
+        if not pin:
+            return
+        force = self.hsmForceCheck.isChecked()
 
-    # --- Drill -------------------------------------------------------------------------
-
-    def _on_self_test(self) -> None:
         def make() -> FunctionWorker:
-            return FunctionWorker(bc.self_test)
+            return FunctionWorker(
+                _do_hsm_restore, backup_dir, pin,
+                self._selected_serial(), force, identity_text,
+            )
 
-        def done(ok: bool) -> None:
-            if ok:
-                self._show_success("Selbsttest bestanden.")
+        def done(result: dict) -> None:
+            report, verification = result["report"], result["verification"]
+            missing = (verification["missing_keys"]
+                       + verification["missing_data"])
+            text = (
+                f"Restore ok: {len(report['keys'])} Keys, "
+                f"{len(report['data'])} Datenobjekte."
+            )
+            if missing:
+                text += f" Fehlt: {', '.join(missing)}."
+                self._show_warning(text)
             else:
-                self._show_error("Selbsttest FEHLGESCHLAGEN.")
+                self._show_success(text)
+            if verification["options_ok"] is False:
+                self._show_warning("Dynamic Options weichen vom Manifest ab.")
+            self.hsmResultLabel.setText(text)
 
-        self._start_worker(make, done, self.selfTestButton)
+        self._start_worker(make, done, self.hsmRestoreButton)
 
-    def _on_real_drill(self) -> None:
-        backup_dir = self.drillDirEdit.text().strip()
-        shares = _parse_shares(self.drillSharesEdit.toPlainText())
-        if not backup_dir:
-            self._show_error("Backup-Ordner angeben.")
-            return
-        if not shares:
-            self._show_error("Mindestens ein Share eingeben.")
-            return
 
-        def make() -> FunctionWorker:
-            def drill():
-                return bc.real_drill(Path(backup_dir), shares)
 
-            return FunctionWorker(drill)
-
-        def done(ok: bool) -> None:
-            self.drillSharesEdit.setPlainText("")
-            if ok:
-                self._show_success("Drill bestanden.")
-            else:
-                self._show_error("Drill FEHLGESCHLAGEN.")
-
-        self._start_worker(make, done, self.drillButton)
+    def _on_hsm_restore_identity_browse(self) -> None:
+        path = _ask_open_file(self, "Identity-Datei wählen")
+        if path:
+            self.hsmRestoreIdentityEdit.setText(path)
 
     # --- Liste ---------------------------------------------------------------------------
 
@@ -441,26 +452,35 @@ class BackupTab(QWidget):
 
     def _on_list_finished(self, infos: list) -> None:
         self.backupsTable.setRowCount(len(infos))
-        leftover = False
+        warn_count = 0
         for row, info in enumerate(infos):
             self.backupsTable.setItem(row, 0, QTableWidgetItem(str(info.path)))
-            self.backupsTable.setItem(
-                row, 1, QTableWidgetItem(info.created_at or "?"),
-            )
+            created = info.created_at or "?"
+            if getattr(info, "age_days", None) is not None:
+                created = f"{created} (vor {info.age_days} Tagen)"
+            self.backupsTable.setItem(row, 1, QTableWidgetItem(created))
             self.backupsTable.setItem(
                 row, 2,
-                QTableWidgetItem(f"{info.threshold}-von-{info.total_shares}"),
+                QTableWidgetItem(backup_index.schema_text(info)),
             )
             self.backupsTable.setItem(
                 row, 3, QTableWidgetItem(info.ciphertext_sha256 or "?"),
             )
-            if info.last_drill_at:
-                drill_text = f"{info.last_drill_at} -> {info.last_drill_result}"
-            else:
-                drill_text = "noch nie — Drill empfohlen!"
+            drill_text = backup_index.drill_text(info)
             self.backupsTable.setItem(row, 4, QTableWidgetItem(drill_text))
-            if info.leftover_shares_file_present:
-                leftover = True
+            label = backup_index.hygiene_label(info)
+            self.backupsTable.setItem(row, 5, QTableWidgetItem(label))
+            if label != "OK":
+                warn_count += 1
+        if warn_count:
+            self._show_warning(
+                f"Hygiene: {warn_count}/{len(infos)} Backup(s) mit Warnung — "
+                "Spalte Hygiene + Letzter Drill prüfen."
+            )
+        leftover = any(
+            getattr(info, "leftover_shares_file_present", False)
+            for info in infos
+        )
         if leftover:
             self._show_warning(
                 "shares-DO-NOT-KEEP-TOGETHER.txt liegt noch bei einem Backup — "

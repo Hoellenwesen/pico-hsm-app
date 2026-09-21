@@ -33,20 +33,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from .paths import base_dir
+
 try:
     import pyotp
 except ImportError:  # pragma: no cover - optionale Abhängigkeit
     pyotp = None
 
 
-AUDIT_LOG = Path.home() / ".pico_hsm" / "update_audit.jsonl"
+AUDIT_LOG = base_dir() / "update_audit.jsonl"
 GENESIS_HASH = "0" * 64
 
 # Muss vor dem ersten produktiven Einsatz gesetzt werden:
 #   openssl pkey -in secure-boot-key.pem -pubout -outform DER | sha256sum
 KNOWN_PUBKEY_FINGERPRINT = "REPLACE_WITH_YOUR_KEY_SHA256_FINGERPRINT"
-
-MIN_PICOTOOL_VERSION = (2, 2, 0)
 
 # Empirisch gegen echte picotool-v2.3.0-Ausgabe verifiziert (siehe
 # get_uf2_version()/verify_signature()). Beide Felder erscheinen mehrfach
@@ -56,6 +56,9 @@ MIN_PICOTOOL_VERSION = (2, 2, 0)
 _VERSION_RE = re.compile(r"^\s*version:\s+(\d+)\.(\d+)\s*$", re.MULTILINE)
 _ROLLBACK_RE = re.compile(r"^\s*rollback version:\s+(\d+)\s*$", re.MULTILINE)
 _SIGNATURE_RE = re.compile(r"^\s*signature:\s+(\S+)\s*$", re.MULTILINE)
+_SECURE_BOOT_RE = re.compile(
+    r"^\s*secure boot:\s*([01])\s*$", re.MULTILINE | re.IGNORECASE,
+)
 
 
 class FlashError(Exception):
@@ -80,6 +83,14 @@ class PreflightResult:
     version: Uf2Info
     board_fingerprint: str
     last_known_rollback: int
+    # Getroffene Entscheidung (Hardware-Validierung): Fingerprint-Check
+    # nur bei Secure Boot an erzwungen (secure_boot_enabled True). Ohne
+    # Secure-Boot-Anker ist nichts gebrannt — Vergleich wäre immer rot,
+    # daher Warnung statt Abbruch (fingerprint_checked False). Defaults
+    # erhalten das bisherige Verhalten für bestehende Konstruktoren.
+    secure_boot_enabled: bool = True
+    fingerprint_checked: bool = True
+    signature_checked: bool = True
 
 
 # --------------------------------------------------------------------------
@@ -92,16 +103,22 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
-def _run_picotool(args: list[str]) -> subprocess.CompletedProcess:
+def _run_picotool(args: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
-            ["picotool", *args], capture_output=True, text=True
+            ["picotool", *args], capture_output=True, text=True, timeout=timeout
         )
     except FileNotFoundError as exc:
         raise FlashError(
             "picotool wurde nicht gefunden. Installation prüfen "
             "(muss USB-Support haben — die CMake-Auto-Download-Variante "
-            "hat das NICHT, siehe docs/04-dev-environment.md)."
+            "hat das NICHT, siehe docs/02-setup.md §2)."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise FlashError(
+            f"picotool antwortet nicht (Timeout {timeout:g}s bei "
+            f"{' '.join(args)}) — Board angeschlossen und im richtigen "
+            "Modus (BOOTSEL für otp/info)?"
         ) from exc
 
 
@@ -125,60 +142,65 @@ def get_burned_key_fingerprint() -> str:
     SHA-256) vom angeschlossenen Board — das ist der reale Vertrauensanker,
     nicht eine lokale PEM-Datei, die manipuliert sein könnte.
 
-    Der Fingerprint ist laut RP2350-Sicherheits-Whitepaper 32 Byte lang
-    und wird als Array einzelner Bytes in OTP programmiert (siehe
-    otp_config.json-Beispiele: "bootkey0": [32 Werte]). Das exakte
-    picotool-Feldnamensschema für einzelne Bytes/Wörter beim Lesen war
-    nicht zuverlässig zu verifizieren (keine echte RP2350-Hardware
-    verfügbar). Statt ein Namensschema zu raten, wird hier `picotool
-    otp list` (Dump aller benannten Felder) geparst: alle Zeilen, deren
-    Feldname mit "BOOTKEY0" beginnt, werden gesammelt, nach ihrem
-    numerischen Suffix sortiert und zu einem 32-Byte-Wert zusammengesetzt.
-    Ergibt das zusammengesetzte Ergebnis nicht exakt 32 Byte, wird hart
-    abgebrochen (FlashError) statt einen falschen/unvollständigen
-    Fingerprint zurückzugeben — ein falscher Fingerprint wäre hier
-    schlimmer als ein klarer Fehler.
+    Format VERIFIZIERT am Ersatzboard (BOOTSEL, picotool v2.3.1): Der Hash
+    liegt in 16 Rows `OTP_DATA_BOOTKEY0_0..15` (je 16 Bit). Jede wird per
+    `picotool otp get <feld>` gelesen; die Antwort enthält nach einer
+    Leerzeile die Zeile `    VALUE 0x....` (z.B. `VALUE 0x0000` auf
+    unberührtem Board). Die 16×4 Hexzeichen ergeben den 64-zeichen
+    Fingerprint (lowercase).
 
-    OFFENER PUNKT: Muss beim ersten Test an echter Hardware gegen die
-    tatsächliche `picotool otp list`-Ausgabe verifiziert und ggf. das
-    Parsing angepasst werden (siehe docs/15-real-hardware-validation-
-    checklist.md).
+    Hart abbrechen (FlashError) statt raten: fehlende VALUE-Zeile,
+    picotool-Fehler oder überlange Werte (niemals Hash-Material still
+    kürzen) — ein falscher Fingerprint wäre schlimmer als ein klarer
+    Fehler. Hinweis: `picotool otp list` zeigt KEINE Werte (nur Struktur),
+    daher der Einzel-Row-Ansatz statt Listen-Parsing.
+
+    VERIFIZIERT (§12, docs/15 Phase 1): komponierter Wert am Board
+    gemessen — unberührtes Board: 64× `0`.
     """
-    result = _run_picotool(["otp", "list"])
-    if result.returncode != 0:
-        raise FlashError(
-            "Konnte OTP-Feldliste nicht lesen (`picotool otp list` "
-            f"fehlgeschlagen, kein Board im Normal-Modus angeschlossen?). "
-            f"stderr: {result.stderr.strip()}"
-        )
+    parts: list[str] = []
+    for index in range(16):
+        field = f"OTP_DATA_BOOTKEY0_{index}"
+        result = _run_picotool(["otp", "get", field])
+        if result.returncode != 0:
+            raise FlashError(
+                f"Konnte OTP-Feld {field} nicht lesen (`picotool otp get` "
+                f"fehlgeschlagen, Board im BOOTSEL-Modus angeschlossen?). "
+                f"stderr: {result.stderr.strip()}"
+            )
+        digits = _extract_otp_value(result.stdout, field)
+        if len(digits) > 4:
+            raise FlashError(
+                f"Unerwartet langer Wert in {field} ({len(digits)} statt "
+                "max. 4 Hexzeichen für 16-Bit-Row) — kein stilles Kürzen "
+                "von Hash-Material."
+            )
+        parts.append(digits.zfill(4))
 
-    words: dict[int, str] = {}
-    pattern = re.compile(r"^\s*BOOTKEY0(?:_(\d+))?\s+(?:0[xX])?([0-9a-fA-F]+)\s*$")
-    for line in result.stdout.splitlines():
-        match = pattern.match(line)
-        if not match:
-            continue
-        index = int(match.group(1)) if match.group(1) is not None else 0
-        words[index] = match.group(2)
-
-    if not words:
-        raise FlashError(
-            "Keine 'BOOTKEY0'-Felder in `picotool otp list`-Ausgabe "
-            "gefunden. Das erwartete Feldnamensschema wurde nicht "
-            "verifiziert (keine Testhardware) — Ausgabe manuell prüfen "
-            "und diese Funktion anpassen, statt zu raten."
-        )
-
-    ordered = [words[i] for i in sorted(words.keys())]
-    fingerprint = "".join(ordered).lower()
+    fingerprint = "".join(parts).lower()
     if len(fingerprint) != 64:
         raise FlashError(
             f"Zusammengesetzter Fingerprint hat {len(fingerprint)} statt "
-            "64 Hexzeichen (32 Byte) — Feldnamensschema oder Parsing "
-            "stimmt nicht mit der tatsächlichen picotool-Ausgabe überein. "
-            "Nicht mit einem unvollständigen Fingerprint weitermachen."
+            "64 Hexzeichen (32 Byte) — nicht mit einem unvollständigen "
+            "Fingerprint weitermachen."
         )
     return fingerprint
+
+
+_OTP_VALUE_RE = re.compile(
+    r"^\s*VALUE\s+0[xX]([0-9a-fA-F]+)\s*$", re.MULTILINE,
+)
+
+
+def _extract_otp_value(output: str, field: str) -> str:
+    """Hex-Ziffern aus der VALUE-Zeile einer `picotool otp get`-Antwort
+    holen (ohne 0x-Präfix). Format verifiziert, siehe oben."""
+    match = _OTP_VALUE_RE.search(output)
+    if not match:
+        raise FlashError(
+            f"Kein VALUE in `picotool otp get {field}`-Ausgabe gefunden."
+        )
+    return match.group(1)
 
 
 def verify_board_identity(expected_fingerprint: str) -> str:
@@ -214,9 +236,10 @@ OTP_FLAG_FIELDS = [
 def read_otp_field(field: str) -> str:
     """Einzelnes OTP-Feld lesen — Anzeige, kein Fehlerwurf.
 
-    Gibt den Wert oder eine lesbare Ersatzmeldung zurück (statt zu
-    werfen: fehlendes Board/picotool ist im Anzeige-Kontext ein
-    erwarteter Zustand, kein Programmfehler).
+    Gibt den VALUE-Wert (`0x...`, Format verifiziert siehe
+    get_burned_key_fingerprint) oder eine lesbare Ersatzmeldung zurück
+    (statt zu werfen: fehlendes Board/picotool ist im Anzeige-Kontext
+    ein erwarteter Zustand, kein Programmfehler).
     """
     try:
         result = subprocess.run(
@@ -229,7 +252,10 @@ def read_otp_field(field: str) -> str:
         return "Timeout beim Lesen"
     if result.returncode != 0:
         return f"nicht lesbar ({result.stderr.strip() or 'kein Board?'})"
-    return result.stdout.strip()
+    try:
+        return "0x" + _extract_otp_value(result.stdout, field)
+    except FlashError:
+        return "nicht lesbar (kein VALUE in Ausgabe)"
 
 
 # --------------------------------------------------------------------------
@@ -245,6 +271,11 @@ def get_uf2_version(path: Path) -> Uf2Info:
     dieses Flag existiert nicht (`picotool help info` zeigt nur
     -b/-m/-p/-d/--debug/-l/-a). Die Version erscheint als eine Zeile
     "version:    MAJOR.MINOR" und "rollback version:    N" im Klartext.
+
+    Hardware-Korrektur (Ersatzboard): Unsignierte Dev-Builds enthalten
+    KEINE Rollback-Zeile — dann rollback=-1 (unbekannt) statt Abbruch.
+    Die Version selbst bleibt Pflicht (ohne sie ist die Datei unbrauchbar
+    für den Update-Vergleich).
     """
     result = _run_picotool(["info", "-a", str(path)])
     if result.returncode != 0:
@@ -254,19 +285,41 @@ def get_uf2_version(path: Path) -> Uf2Info:
         )
 
     version_match = _VERSION_RE.search(result.stdout)
-    rollback_match = _ROLLBACK_RE.search(result.stdout)
-    if not version_match or not rollback_match:
+    if not version_match:
         raise FlashError(
-            "Keine Version-/Rollback-Angabe in der Datei gefunden — wurde "
+            "Keine Versions-Angabe in der Datei gefunden — wurde "
             "sie mit `picotool seal --sign --major .. --minor .. "
-            "--rollback ..` versiegelt? Bei unklarer/fehlender Angabe wird "
+            "--rollback ..` versiegelt? Bei unklarer Angabe wird "
             "bewusst abgebrochen, nicht geraten."
         )
+    rollback_match = _ROLLBACK_RE.search(result.stdout)
     return Uf2Info(
         major=int(version_match.group(1)),
         minor=int(version_match.group(2)),
-        rollback=int(rollback_match.group(1)),
+        rollback=int(rollback_match.group(1)) if rollback_match else -1,
     )
+
+
+def format_version_rollback(version: Uf2Info) -> str:
+    """Anzeige-Text für Version/Rollback (`-1` = unbekannt, siehe oben)."""
+    if version.rollback < 0:
+        return f"{version.major}.{version.minor} (rollback unbekannt)"
+    return f"{version.major}.{version.minor} (rollback={version.rollback})"
+
+
+def _signature_state_for_file(path: Path) -> bool | None:
+    """Signatur-Status einer UF2-Datei: True = verifiziert, False =
+    Zeile vorhanden aber NICHT verified (manipuliert/falsch signiert),
+    None = KEINE signature-Zeile (unsigniertes Dev-Build, z.B.
+    selbst-kompilierte Firmware ohne Secure-Boot-Keys — am Board
+    gemessen: nur `hash: verified` der Partitionstabelle vorhanden)."""
+    result = _run_picotool(["info", "-a", str(path)])
+    if result.returncode != 0:
+        return None
+    match = _SIGNATURE_RE.search(result.stdout)
+    if not match:
+        return None
+    return match.group(1).strip().lower() == "verified"
 
 
 def verify_signature(path: Path) -> bool:
@@ -282,13 +335,30 @@ def verify_signature(path: Path) -> bool:
     Signatur trotzdem Exit-Code 0 zurück — der Text muss geparst werden,
     der Exit-Code allein reicht nicht (gegen absichtlich manipulierte
     Testdatei verifiziert)."""
-    result = _run_picotool(["info", "-a", str(path)])
+    return _signature_state_for_file(path) is True
+
+
+def is_secure_boot_enabled() -> bool:
+    """Secure-Boot-Status des angeschlossenen Boards (BOOTSEL nötig).
+
+    Liest `picotool info -a` (Gerät, keine Datei) und parst die Zeile
+    `secure boot: 0/1` (verifiziert gegen reale Ausgabe:
+    ` secure boot:            0`). Wirft FlashError, wenn kein Board
+    erreichbar oder die Zeile fehlt — Aufrufer melden BOOTSEL-Hinweis.
+    """
+    result = _run_picotool(["info", "-a"])
     if result.returncode != 0:
-        return False
-    match = _SIGNATURE_RE.search(result.stdout)
+        raise FlashError(
+            "Board nicht erreichbar (`picotool info -a` fehlgeschlagen) — "
+            "Board im BOOTSEL-Modus anschließen."
+        )
+    match = _SECURE_BOOT_RE.search(result.stdout)
     if not match:
-        return False
-    return match.group(1).strip().lower() == "verified"
+        raise FlashError(
+            "Secure-Boot-Status nicht ermittelbar (keine `secure boot:`-"
+            "Zeile in `picotool info -a`-Ausgabe)."
+        )
+    return match.group(1) == "1"
 
 
 # --------------------------------------------------------------------------
@@ -365,7 +435,7 @@ def load_last_known() -> dict:
 
 #: Pfad der lokalen TOTP-Secret-Datei (eine Quelle der Wahrheit für
 #: CLI und GUI; fehlt die Datei, ist die Schicht deaktiviert).
-TOTP_SECRET_FILE = Path.home() / ".pico_hsm" / "totp_secret.txt"
+TOTP_SECRET_FILE = base_dir() / "totp_secret.txt"
 
 def verify_totp_code(totp_secret_b32: str, entered_code: str) -> bool:
     """entered_code kommt manuell vom Nutzer, abgetippt von einem
@@ -404,19 +474,55 @@ def run_preflight(
     check_picotool_available()
     digest = sha256_of(fw_path)
 
-    if not verify_signature(fw_path):
+    secure_boot = is_secure_boot_enabled()
+    sig_state = _signature_state_for_file(fw_path)
+    if sig_state is False:
+        # Echte Fehl-Signatur (Zeile vorhanden, nicht "verified") —
+        # immer ein Abbruch, unabhängig vom Secure-Boot-Status.
         append_audit({
             "file": str(fw_path), "sha256": digest,
             "status": "rejected_signature",
         })
         raise FlashError("Signaturprüfung fehlgeschlagen. Abbruch.")
+    if sig_state is None and secure_boot:
+        # Release ohne Signaturzeile bei aktivem Secure Boot.
+        append_audit({
+            "file": str(fw_path), "sha256": digest,
+            "status": "rejected_signature",
+        })
+        raise FlashError(
+            "Keine Signatur in der Firmware-Datei gefunden, Secure Boot "
+            "ist aber aktiv. Abbruch."
+        )
+    signature_checked = sig_state is True
+    if not signature_checked:
+        # Getroffene Entscheidung (Hardware-Validierung, Secure Boot aus,
+        # unsigniertes Dev-Build): Warnung statt Abbruch — sonst wäre auf
+        # solchen Boards gar kein Flash möglich. Aufrufer zeigen die
+        # Warnung an; Audit hält die Entscheidung fest.
+        append_audit({
+            "file": str(fw_path), "sha256": digest,
+            "status": "accepted_unsigned",
+        })
 
-    board_fingerprint = verify_board_identity(expected_fingerprint)
+    if secure_boot:
+        board_fingerprint = verify_board_identity(expected_fingerprint)
+        fingerprint_checked = True
+    else:
+        # Getroffene Entscheidung (Hardware-Validierung, Secure Boot aus):
+        # Ohne Secure-Boot-Anker ist nichts gebrannt — ein Vergleich wäre
+        # immer rot. Warnung statt Abbruch; Aufrufer zeigen sie an.
+        # get_burned_key_fingerprint() wird hier bewusst NICHT aufgerufen.
+        board_fingerprint = ""
+        fingerprint_checked = False
 
     version = get_uf2_version(fw_path)
     last = load_last_known()
     last_rollback = last.get("rollback", -1)
-    if version.rollback < last_rollback:
+    # Guard: rollback=-1 heißt UNBEKANNT (unsigniertes Dev-Build) und darf
+    # niemals einen Downgrade-Fehlalarm auslösen (sonst wäre jeder Dev-Flash
+    # blockiert, sobald je ein Rollback protokolliert wurde).
+    if version.rollback >= 0 and version.rollback < last_rollback:
         append_audit({
             "file": str(fw_path), "sha256": digest,
             "version": f"{version.major}.{version.minor}",
@@ -434,6 +540,9 @@ def run_preflight(
         version=version,
         board_fingerprint=board_fingerprint,
         last_known_rollback=last_rollback,
+        secure_boot_enabled=secure_boot,
+        fingerprint_checked=fingerprint_checked,
+        signature_checked=signature_checked,
     )
 
 
@@ -462,4 +571,6 @@ def do_flash(
         "rollback": preflight.version.rollback,
         "status": "flashed",
     })
-    log("[OK] Firmware erfolgreich geflasht")
+    # KEIN Erfolgs-Log hier: Erfolgsmeldung ist Sache der Aufrufer
+    # (CLI echo / GUI InfoBar) — sonst erscheint sie doppelt (Bug
+    # am Board gemeldet). Erfolg = Rückkehr ohne Exception + Audit.

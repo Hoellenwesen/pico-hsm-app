@@ -87,6 +87,43 @@ def test_unwrap_maps_stderr_to_error(monkeypatch):
         dc.unwrap_key("C:/tmp/k.wrap", 3, "1234")
 
 
+def test_failure_message_includes_stdout_detail(monkeypatch):
+    """Hardware-Befund: Detail steht teils auf stdout (reines stderr
+    zeigte nur `Using reader ...`)."""
+    _install_run(
+        monkeypatch,
+        lambda args: _result(
+            1, stderr="Using reader with a card: X",
+            stdout="Found existing certificate in EF with fid ce01.",
+        ),
+    )
+    with pytest.raises(dc.DkekError) as exc_info:
+        dc.unwrap_key("C:/tmp/k.wrap", 3, "1234")
+    assert "Using reader" in str(exc_info.value)
+    assert "fid ce01" in str(exc_info.value)
+
+
+def test_failure_message_falls_back_to_default(monkeypatch):
+    _install_run(monkeypatch, lambda args: _result(1))
+    with pytest.raises(dc.DkekError, match="unwrap-key fehlgeschlagen"):
+        dc.unwrap_key("C:/tmp/k.wrap", 3, "1234")
+
+
+def test_unwrap_force_appends_flag(monkeypatch):
+    calls = _install_run(monkeypatch, lambda args: _result())
+    dc.unwrap_key("C:/tmp/k.wrap", 3, "1234", force=True)
+    assert calls == [(
+        ["sc-hsm-tool", "--unwrap-key", "C:/tmp/k.wrap",
+         "--key-reference", "3", "--pin", "1234", "--force"], 30,
+    )]
+
+
+def test_unwrap_without_force_has_no_flag(monkeypatch):
+    calls = _install_run(monkeypatch, lambda args: _result())
+    dc.unwrap_key("C:/tmp/k.wrap", 3, "1234")
+    assert "--force" not in calls[0][0]
+
+
 # --- status ------------------------------------------------------------------------------
 
 def test_status_returns_raw_text(monkeypatch):

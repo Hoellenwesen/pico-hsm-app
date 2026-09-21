@@ -2,9 +2,12 @@
 test_gui_setup_tab.py — Setup-Tab-Tests ohne Display und ohne Hardware.
 
 Core (flash_core, apdu_core) wird gemockt, Worker laufen echt. Deckt ab:
-Aufbau, OTP-Tabelle, Datetime-Anzeige/Setzen (inkl. Confirm-Abbruch),
-Dynamic-Options-Anwenden (inkl. P2C-Deaktivierungs-Warntext),
-Fehler-InfoBars, Disconnect-Hygiene, Refresh-bei-Tab-Wechsel.
+Aufbau, OTP-Tabelle, Dynamic-Options-Anwenden (inkl.
+P2C-Deaktivierungs-Warntext), Fehler-InfoBars, Disconnect-Hygiene,
+Refresh-bei-Tab-Wechsel, Login-Hinweis.
+
+Entfernt: RTC-Datetime (Firmware v6.6 implementiert das Kommando nicht —
+Karte antwortet 6A86, quellverifiziert in cmd_extras.c).
 """
 
 from __future__ import annotations
@@ -13,9 +16,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from datetime import datetime
-
-from PySide6.QtCore import QDateTime, Qt
+from PySide6.QtCore import Qt
 from qfluentwidgets import InfoBar
 
 from gui.main_window import MainWindow
@@ -32,12 +33,11 @@ class FakeConnection:
         self.disconnects += 1
 
 
-def _install_mocks(monkeypatch, fingerprint="AA" * 32, dt=None,
+def _install_mocks(monkeypatch, fingerprint="AA" * 32,
                    ptc=True, counter=False, otp_error=None, apdu_error=None):
     """Core mocken. Gibt (calls, connection) zurück."""
-    calls: dict = {"sets": [], "options": [], "confirms": []}
+    calls: dict = {"options": [], "confirms": []}
     connection = FakeConnection()
-    moment = dt or datetime(2022, 4, 6, 19, 41, 23)
 
     def fake_fingerprint():
         if otp_error is not None:
@@ -49,23 +49,18 @@ def _install_mocks(monkeypatch, fingerprint="AA" * 32, dt=None,
             raise apdu_error
         return connection
 
-    def fake_set_datetime(conn, value):
-        calls["sets"].append(value)
-
     def fake_set_options(conn, options):
         calls["options"].append(options)
 
     monkeypatch.setattr(fc, "get_burned_key_fingerprint", fake_fingerprint)
     monkeypatch.setattr(fc, "read_otp_field", lambda field: f"mock-{field}")
     monkeypatch.setattr(ac, "open_connection", fake_open)
-    monkeypatch.setattr(ac, "get_datetime", lambda conn: moment)
     monkeypatch.setattr(
         ac, "get_dynamic_options",
         lambda conn: ac.DynamicOptions(
             press_to_confirm=ptc, key_usage_counter=counter,
         ),
     )
-    monkeypatch.setattr(ac, "set_datetime", fake_set_datetime)
     monkeypatch.setattr(ac, "set_dynamic_options", fake_set_options)
     monkeypatch.setattr(
         setup_mod, "confirm_destructive",
@@ -88,12 +83,24 @@ def test_builds_with_all_sections(qtbot, monkeypatch):
     tab, _ = _make_tab(qtbot, monkeypatch)
     try:
         for name in (
-            "fingerprintLabel", "otpTable", "datetimeCurrentLabel",
-            "datetimeEdit", "nowButton", "datetimeSetButton",
+            "fingerprintLabel", "otpTable",
             "ptcSwitch", "counterSwitch", "dynoptsApplyButton",
             "setupRefreshButton",
         ):
             assert tab.findChild(object, name) is not None, name
+        # Login-Hinweis (Hardware-Befund: ohne PIN-Login antwortet SW=6982).
+        texts = []
+        for widget in tab.findChildren(object):
+            get_text = getattr(widget, "text", None)
+            if not callable(get_text):
+                continue
+            try:
+                value = get_text()
+            except Exception:  # noqa: BLE001 — Test-Helfer, nie fehlschlagen
+                continue
+            if isinstance(value, str):
+                texts.append(value)
+        assert any("6982" in text for text in texts)
     finally:
         tab.close()
 
@@ -109,7 +116,6 @@ def test_refresh_fills_all_sections(qtbot, monkeypatch):
             timeout=5000,
         )
         assert "AA" in tab.fingerprintLabel.text()
-        assert "2022-04-06 19:41:23" in tab.datetimeCurrentLabel.text()
         assert tab.ptcSwitch.isChecked() is True
         assert tab.counterSwitch.isChecked() is False
         assert tab.findChildren(InfoBar) == []
@@ -126,7 +132,6 @@ def test_fingerprint_failure_blocks_nothing(qtbot, monkeypatch):
         qtbot.waitUntil(lambda: bool(tab.findChildren(InfoBar)), timeout=5000)
         assert "nicht lesbar" in tab.fingerprintLabel.text()
         assert tab.otpTable.rowCount() == len(fc.OTP_FLAG_FIELDS)
-        assert "19:41:23" in tab.datetimeCurrentLabel.text()
     finally:
         tab.close()
 
@@ -138,53 +143,12 @@ def test_apdu_failure_blocks_nothing(qtbot, monkeypatch):
     try:
         tab.refresh()
         qtbot.waitUntil(lambda: bool(tab.findChildren(InfoBar)), timeout=5000)
-        assert "nicht lesbar" in tab.datetimeCurrentLabel.text()
         assert "AA" in tab.fingerprintLabel.text()
     finally:
         tab.close()
 
 
 # --- Schreiben ---------------------------------------------------------------------
-
-def test_datetime_set_encodes_and_disconnects(qtbot, monkeypatch):
-    tab, (calls, connection) = _make_tab(qtbot, monkeypatch)
-    try:
-        tab.datetimeEdit.setDateTime(QDateTime(2022, 4, 6, 19, 41, 23))
-        qtbot.mouseClick(tab.datetimeSetButton, Qt.LeftButton)
-        qtbot.waitUntil(
-            lambda: "2022-04-06 19:41:23" in tab.datetimeCurrentLabel.text(),
-            timeout=5000,
-        )
-        assert calls["sets"] == [datetime(2022, 4, 6, 19, 41, 23)]
-        assert connection.disconnects >= 1
-        assert len(calls["confirms"]) == 1
-    finally:
-        tab.close()
-
-
-def test_datetime_set_cancel_aborts(qtbot, monkeypatch):
-    tab, (calls, _) = _make_tab(qtbot, monkeypatch)
-    monkeypatch.setattr(
-        setup_mod, "confirm_destructive", lambda *a: False,
-    )
-    try:
-        qtbot.mouseClick(tab.datetimeSetButton, Qt.LeftButton)
-        qtbot.wait(300)
-        assert calls["sets"] == []
-        assert "Noch nicht abgefragt" in tab.datetimeCurrentLabel.text()
-    finally:
-        tab.close()
-
-
-def test_now_button_fills_current_time(qtbot, monkeypatch):
-    tab, _ = _make_tab(qtbot, monkeypatch)
-    try:
-        tab.datetimeEdit.setDateTime(QDateTime(2001, 1, 1, 0, 0, 0))
-        qtbot.mouseClick(tab.nowButton, Qt.LeftButton)
-        assert tab.datetimeEdit.dateTime().toPython().date() == datetime.now().date()
-    finally:
-        tab.close()
-
 
 def test_dynopts_apply_sends_mask(qtbot, monkeypatch):
     tab, (calls, connection) = _make_tab(qtbot, monkeypatch)

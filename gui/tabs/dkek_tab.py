@@ -1,10 +1,10 @@
-"""dkek_tab.py — DKEK-Bereich (Schritt 6d: vierter ausgebauter Tab).
+"""dkek_tab.py — DKEK-Bereich.
 
 Sektionen: Status (Roh-Text, read-only), Key-Export (wrappen),
 Key-Import (unwrappen). Core-Logik aus pico_hsm_tools/dkek_core.py
 (sc-hsm-tool-Subprozesse).
 
-BEWUSST NICHT ENTHALTEN (getroffene Entscheidung, Schritt 6d):
+BEWUSST NICHT ENTHALTEN (getroffene Entscheidung):
 Create/Import-Share brauchen ein interaktives Terminal
 (Custodian-Passworteingabe) und bleiben CLI-only — der Tab weist per
 Hinweistext darauf hin, statt stdin-Raten ohne Hardware-Nachweis.
@@ -33,7 +33,6 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarPosition,
     LineEdit,
-    PasswordLineEdit,
     PrimaryPushButton,
     PushButton,
     StrongBodyLabel,
@@ -41,7 +40,7 @@ from qfluentwidgets import (
     TitleLabel,
 )
 
-from gui.session_helpers import confirm_destructive
+from gui.session_helpers import close_info_bars, confirm_destructive
 from gui.workers import FunctionWorker
 from pico_hsm_tools import dkek_core as dc
 
@@ -56,15 +55,6 @@ def _ask_open_path(parent: QWidget, caption: str) -> str | None:
     """Öffnen-Dialog (eigene Funktion: in Tests ohne echten Dialog)."""
     path, _ = QFileDialog.getOpenFileName(parent, caption)
     return path or None
-
-
-def _pin_field(parent: QWidget, name: str, placeholder: str) -> PasswordLineEdit:
-    """Strikt verdecktes PIN-Feld (Auge-Button versteckt — Entscheidung)."""
-    field = PasswordLineEdit(parent)
-    field.setObjectName(name)
-    field.setPlaceholderText(placeholder)
-    field.viewButton.hide()
-    return field
 
 
 def _query_dkek_status() -> dict[str, Any]:
@@ -134,12 +124,11 @@ class DkekTab(QWidget):
         self.wrapRefSpin.setObjectName("wrapRefSpin")
         self.wrapRefSpin.setRange(0, 65535)
         self.wrapRefSpin.setPrefix("Ref ")
-        self.wrapPinEdit = _pin_field(self, "wrapPinEdit", "User-PIN")
         self.wrapButton = PrimaryPushButton("Exportieren", self)
         self.wrapButton.setObjectName("wrapButton")
         self.wrapButton.clicked.connect(self._on_wrap)
         wrap_param_row.addWidget(self.wrapRefSpin)
-        wrap_param_row.addWidget(self.wrapPinEdit, 1)
+        wrap_param_row.addWidget(BodyLabel("PIN aus Anmeldung.", self), 1)
         wrap_param_row.addWidget(self.wrapButton)
         layout.addLayout(wrap_param_row)
 
@@ -160,12 +149,11 @@ class DkekTab(QWidget):
         self.unwrapRefSpin.setObjectName("unwrapRefSpin")
         self.unwrapRefSpin.setRange(0, 65535)
         self.unwrapRefSpin.setPrefix("Ref ")
-        self.unwrapPinEdit = _pin_field(self, "unwrapPinEdit", "User-PIN")
         self.unwrapButton = PrimaryPushButton("Importieren", self)
         self.unwrapButton.setObjectName("unwrapButton")
         self.unwrapButton.clicked.connect(self._on_unwrap)
         unwrap_param_row.addWidget(self.unwrapRefSpin)
-        unwrap_param_row.addWidget(self.unwrapPinEdit, 1)
+        unwrap_param_row.addWidget(BodyLabel("PIN aus Anmeldung.", self), 1)
         unwrap_param_row.addWidget(self.unwrapButton)
         layout.addLayout(unwrap_param_row)
 
@@ -184,9 +172,7 @@ class DkekTab(QWidget):
 
     def refresh(self) -> None:
         """DKEK-Status neu abfragen (Button + Tab-Wechsel)."""
-        for bar in self._info_bars:
-            bar.close()
-        self._info_bars.clear()
+        close_info_bars(self._info_bars)
 
         self.dkekRefreshButton.setEnabled(False)
         self._worker = FunctionWorker(_query_dkek_status)
@@ -240,11 +226,22 @@ class DkekTab(QWidget):
 
     # --- Schreiben -----------------------------------------------------------
 
+    def _vault_pin(self) -> str | None:
+        from gui.pin_vault import vault
+
+        pin = vault.get()
+        if not pin:
+            self._show_error("Gesperrt — bitte zuerst anmelden (Start-Tab).")
+            return None
+        return pin
+
     def _on_wrap(self) -> None:
         out_file = self.wrapFileEdit.text().strip()
-        pin = self.wrapPinEdit.text()
-        if not out_file or not pin:
-            self._show_error("Zieldatei und User-PIN angeben.")
+        if not out_file:
+            self._show_error("Zieldatei angeben.")
+            return
+        pin = self._vault_pin()
+        if not pin:
             return
         key_reference = self.wrapRefSpin.value()
         if not confirm_destructive(
@@ -264,7 +261,6 @@ class DkekTab(QWidget):
     def _on_wrap_finished(self, out_file: str) -> None:
         self.wrapButton.setEnabled(True)
         self._worker = None
-        self.wrapPinEdit.setText("")
         self._show_success(f"Key exportiert nach {out_file}.")
 
     def _on_wrap_failed(self, exc: Exception) -> None:
@@ -274,9 +270,11 @@ class DkekTab(QWidget):
 
     def _on_unwrap(self) -> None:
         wrapped_file = self.unwrapFileEdit.text().strip()
-        pin = self.unwrapPinEdit.text()
-        if not wrapped_file or not pin:
-            self._show_error("Quelldatei und User-PIN angeben.")
+        if not wrapped_file:
+            self._show_error("Quelldatei angeben.")
+            return
+        pin = self._vault_pin()
+        if not pin:
             return
         key_reference = self.unwrapRefSpin.value()
         if not confirm_destructive(
@@ -296,7 +294,6 @@ class DkekTab(QWidget):
     def _on_unwrap_finished(self, key_reference: int) -> None:
         self.unwrapButton.setEnabled(True)
         self._worker = None
-        self.unwrapPinEdit.setText("")
         self._show_success(
             f"Key erfolgreich als Reference {key_reference} importiert."
         )

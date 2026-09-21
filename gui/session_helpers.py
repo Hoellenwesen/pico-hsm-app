@@ -8,7 +8,7 @@ zu dem Zeitpunkt bereits real aufgetreten, ein Retry ändert daran
 nichts — "Erneut versuchen" wiederholt lediglich den Versuch auf
 Wunsch des Nutzers).
 
-Session-Opener (Schritt 6e, Keys-Tab): dünne Contextmanager um
+Session-Opener (Keys-Tab u.a.): dünne Contextmanager um
 pkcs11_session — kein PIN-Caching hier (PIN-Verwaltung liegt beim
 aufrufenden Tab, z.B. ein Feld pro Tab mit Leerung bei hideEvent).
 SessionConflictError läuft zum Aufrufer durch (dort show_conflict mit
@@ -61,18 +61,69 @@ def show_conflict(
 
 
 @contextmanager
-def open_exclusive_session(pin: str) -> Iterator:
+def open_exclusive_session(
+    pin: str | None = None, serial: str | None = None,
+) -> Iterator:
     """Schreibende PKCS#11-Session (Default-Lib, kein Lib-Override-Feld
-    im Tab). SessionConflictError läuft durch zum Aufrufer."""
-    with exclusive_session(user_pin=pin) as session:
+    im Tab). PIN None = aus dem Vault (Anmeldung); Serial None = Auswahl
+    aus der GUI-Config (Status-Dropdown). SessionConflictError läuft
+    durch zum Aufrufer."""
+    resolved = pin if pin is not None else _vault_pin_or_raise()
+    with exclusive_session(
+        user_pin=resolved, serial=serial or selected_serial(),
+    ) as session:
         yield session
 
 
 @contextmanager
 def open_read_only_session(
-    pin: Optional[str] = None,
+    pin: Optional[str] = None, serial: str | None = None,
 ) -> Iterator:
     """Lesende PKCS#11-Session (PIN optional — öffentliche Objekte gehen
-    auch ohne). SessionConflictError läuft durch zum Aufrufer."""
-    with read_only_session(user_pin=pin) as session:
+    auch ohne; None = aus dem Vault, fällt zurück auf ohne PIN).
+    Serial None = Auswahl aus der GUI-Config.
+    SessionConflictError läuft durch zum Aufrufer."""
+    from gui.pin_vault import vault
+
+    resolved = pin if pin is not None else vault.get()
+    with read_only_session(
+        user_pin=resolved, serial=serial or selected_serial(),
+    ) as session:
         yield session
+
+
+def _vault_pin_or_raise() -> str:
+    """Vault-PIN oder Fehler (Aufrufer zeigt Hinweis statt Blind-Fehler)."""
+    from gui.pin_vault import vault
+
+    pin = vault.get()
+    if not pin:
+        raise VaultLockedError("Gesperrt — bitte zuerst anmelden (Start-Tab).")
+    return pin
+
+
+class VaultLockedError(Exception):
+    """PIN-Cache leer — Anmeldung erforderlich (kein Hardware-Fehler)."""
+
+
+def close_info_bars(bars: list) -> None:
+    """Gespeicherte InfoBars schließen + Liste leeren (tolerant).
+
+    Bars, die der Nutzer per X geschlossen hat (C++-Objekt bereits
+    gelöscht), werfen RuntimeError aus libshiboken — ignorieren statt
+    crashen (Regression: Wizard-DKEK-Abfrage nach X-Klick).
+    """
+    for bar in bars:
+        try:
+            bar.close()
+        except RuntimeError:  # noqa: BLE001 — C++-Objekt schon weg
+            pass
+    bars.clear()
+
+
+def selected_serial() -> str | None:
+    """Gewählte Token-Seriennummer aus der GUI-Config (None = automatisch)."""
+    from gui import config as gui_config
+
+    value = gui_config.cfg.tokenSerial.value.strip()
+    return value or None

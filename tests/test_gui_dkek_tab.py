@@ -67,6 +67,9 @@ def _install_mocks(monkeypatch, status_text="SHARES: 1", status_error=None,
 
 def _make_tab(qtbot, monkeypatch, **kwargs):
     calls = _install_mocks(monkeypatch, **kwargs)
+    from gui.pin_vault import vault
+
+    vault.unlock("pin-1234")
     tab = dkek_mod.DkekTab()
     qtbot.addWidget(tab)
     tab.show()
@@ -87,13 +90,13 @@ def test_builds_with_all_widgets(qtbot, monkeypatch):
     try:
         for name in (
             "dkekStatusText", "dkekRefreshButton",
-            "wrapFileEdit", "wrapBrowseButton", "wrapRefSpin", "wrapPinEdit",
+            "wrapFileEdit", "wrapBrowseButton", "wrapRefSpin",
             "wrapButton", "unwrapFileEdit", "unwrapBrowseButton",
-            "unwrapRefSpin", "unwrapPinEdit", "unwrapButton",
+            "unwrapRefSpin", "unwrapButton",
         ):
             assert tab.findChild(object, name) is not None, name
         fields = tab.findChildren(PasswordLineEdit)
-        assert len(fields) == 2
+        assert len(fields) == 0  # PIN kommt aus dem Vault, kein Feld mehr
         for field in fields:
             assert field.viewButton.isHidden(), field.objectName()
     finally:
@@ -157,18 +160,30 @@ def test_browse_buttons_fill_edits(qtbot, monkeypatch):
 
 # --- Wrap ----------------------------------------------------------------------------
 
-def test_wrap_success_clears_pin_keeps_file(qtbot, monkeypatch):
+def test_wrap_success_uses_vault_keeps_file(qtbot, monkeypatch):
     tab, calls = _make_tab(qtbot, monkeypatch)
     try:
         tab.wrapFileEdit.setText("C:/tmp/out.wrap")
         tab.wrapRefSpin.setValue(7)
-        tab.wrapPinEdit.setText("pin-1234")
         qtbot.mouseClick(tab.wrapButton, Qt.LeftButton)
         qtbot.waitUntil(lambda: bool(tab.findChildren(InfoBar)), timeout=5000)
         assert calls["wraps"] == [("C:/tmp/out.wrap", 7, "pin-1234")]
-        assert tab.wrapPinEdit.text() == ""
         assert tab.wrapFileEdit.text() == "C:/tmp/out.wrap"
         assert "exportiert" in _bar_texts(tab)
+    finally:
+        tab.close()
+
+
+def test_wrap_locked_aborts(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
+    tab, calls = _make_tab(qtbot, monkeypatch)
+    try:
+        vault.lock()
+        tab.wrapFileEdit.setText("C:/tmp/out.wrap")
+        qtbot.mouseClick(tab.wrapButton, Qt.LeftButton)
+        qtbot.wait(300)
+        assert calls["wraps"] == []
     finally:
         tab.close()
 
@@ -190,7 +205,6 @@ def test_wrap_cancel_aborts(qtbot, monkeypatch):
     monkeypatch.setattr(dkek_mod, "confirm_destructive", lambda *a: False)
     try:
         tab.wrapFileEdit.setText("C:/tmp/out.wrap")
-        tab.wrapPinEdit.setText("pin-1234")
         qtbot.mouseClick(tab.wrapButton, Qt.LeftButton)
         qtbot.wait(300)
         assert calls["wraps"] == []
@@ -204,7 +218,6 @@ def test_wrap_failure_leaks_no_pin(qtbot, monkeypatch):
     )
     try:
         tab.wrapFileEdit.setText("C:/tmp/out.wrap")
-        tab.wrapPinEdit.setText("s3cr3t-pin")
         qtbot.mouseClick(tab.wrapButton, Qt.LeftButton)
         qtbot.waitUntil(lambda: bool(tab.findChildren(InfoBar)), timeout=5000)
         texts = _bar_texts(tab)
@@ -221,11 +234,9 @@ def test_unwrap_success_with_overwrite_warning(qtbot, monkeypatch):
     try:
         tab.unwrapFileEdit.setText("C:/tmp/in.wrap")
         tab.unwrapRefSpin.setValue(3)
-        tab.unwrapPinEdit.setText("pin-9999")
         qtbot.mouseClick(tab.unwrapButton, Qt.LeftButton)
         qtbot.waitUntil(lambda: bool(tab.findChildren(InfoBar)), timeout=5000)
-        assert calls["unwraps"] == [("C:/tmp/in.wrap", 3, "pin-9999")]
-        assert tab.unwrapPinEdit.text() == ""
+        assert calls["unwraps"] == [("C:/tmp/in.wrap", 3, "pin-1234")]
         title, text = calls["confirms"][-1]
         assert "ersetzt" in text
         assert "importiert" in _bar_texts(tab)

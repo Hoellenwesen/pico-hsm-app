@@ -6,141 +6,19 @@ import click
 
 from pico_hsm_tools import backup_core as bc
 from pico_hsm_tools import backup_index
+from pico_hsm_tools import hsm_backup as hb
 
 from ..context import CliContext, pass_ctx
 
 
 @click.group()
 def backup() -> None:
-    """Backup/Restore via Shamir Secret Sharing (ssss) + age.
+    """Backups: HSM-Backup (Token-Inhalt, age-Empfänger-Modus 1-aus-n)
+    und Backup-Liste mit Hygiene.
 
-    Komplett in Python (kein Bash mehr) — age und ssss bleiben externe
-    Programme, nur die Orchestrierung ist neu. Der age-Identity-String
-    wird für den Shamir-Split über Bech32-Dekodierung auf die rohen
-    32 Byte reduziert (ssss-Limit: 64 Byte) und nach Rekonstruktion
-    wieder zu einem gültigen age-Identity-String zusammengesetzt.
+    Kein Shamir/ssss mehr (siehe docs/20-roadmap.md) — als künftige
+    Verbesserung ist Python-Shamir geparkt.
     """
-
-
-@backup.command("split")
-@click.argument("export_file", type=click.Path(exists=True, path_type=Path))
-@click.argument("out_dir", type=click.Path(path_type=Path))
-@click.option("--threshold", "-m", required=True, type=int, help="Schwelle (m).")
-@click.option("--total", "-n", required=True, type=int, help="Anzahl Shares (n).")
-@click.option(
-    "--identity-file", type=click.Path(exists=True, path_type=Path), default=None,
-    help="Vorhandenes age-Identity-File nutzen, statt ein neues zu erzeugen.",
-)
-@pass_ctx
-def split_cmd(
-    ctx: CliContext, export_file: Path, out_dir: Path,
-    threshold: int, total: int, identity_file: Path | None,
-) -> None:
-    """Datei verschlüsseln (age) und Identity-Key per Shamir splitten.
-
-    Ohne --identity-file wird ein neues age-Keypair erzeugt (Identity
-    existiert danach nur noch gesplittet in den Shares). Mit
-    --identity-file wird ein vorhandenes Keypair verwendet und dessen
-    Datei unverändert gelassen.
-    """
-    try:
-        manifest = bc.split_backup(
-            export_file, out_dir, threshold, total, identity_file,
-        )
-    except bc.BackupError as exc:
-        ctx.fail(str(exc), exit_code=2)
-        return
-
-    ctx.emit_json(manifest)
-    ctx.echo(f"[OK] Backup nach {out_dir} erstellt ({threshold}-von-{total}).")
-    ctx.echo(f"  Public Key: {manifest['pubkey']}")
-    ctx.echo(
-        "  Wichtig: 'shares-DO-NOT-KEEP-TOGETHER.txt' nach lokalem Drill "
-        "löschen und Einzel-Shares aus individual-shares/ an getrennte "
-        "Orte verteilen (3-2-1)."
-    )
-
-
-@backup.command("restore")
-@click.argument("backup_dir", type=click.Path(exists=True, path_type=Path))
-@click.argument("output_file", type=click.Path(path_type=Path))
-@click.option(
-    "--share", "shares", multiple=True,
-    help="Ein Share-String (share_id-hexdata). Mehrfach angeben für mehrere Shares.",
-)
-@pass_ctx
-def restore_cmd(
-    ctx: CliContext, backup_dir: Path, output_file: Path, shares: tuple[str, ...],
-) -> None:
-    """Aus Shares rekonstruieren und entschlüsseln.
-
-    Shares entweder per --share (mehrfach) übergeben, oder ohne diese
-    Option interaktiv abfragen (leere Zeile beendet die Eingabe) — so
-    bleibt der Ablauf nah am realen Custodian-Workflow (Shares aus
-    getrennten Lagerorten zusammentragen).
-    """
-    share_list = list(shares)
-    if not share_list:
-        ctx.echo("Shares eingeben (leere Zeile zum Abschließen):")
-        while True:
-            line = click.prompt("Share", default="", show_default=False)
-            if not line:
-                break
-            share_list.append(line.strip())
-
-    try:
-        manifest = bc.restore_backup(backup_dir, output_file, share_list)
-    except bc.BackupError as exc:
-        ctx.fail(str(exc), exit_code=2)
-        return
-
-    ctx.emit_json({"status": "ok", "output_file": str(output_file)})
-    ctx.echo(f"[OK] Wiederhergestellt nach {output_file}.")
-
-
-@backup.command("drill")
-@click.argument("backup_dir", type=click.Path(exists=True, path_type=Path), required=False)
-@click.option("--self-test", is_flag=True, help="Automatisierter Selbsttest ohne echtes Backup.")
-@click.option("--share", "shares", multiple=True, help="Share für den echten Drill (mehrfach).")
-@pass_ctx
-def drill_cmd(
-    ctx: CliContext, backup_dir: Path | None, self_test: bool, shares: tuple[str, ...],
-) -> None:
-    """Recovery-Drill: --self-test (automatisiert) oder gegen ein
-    Backup-Verzeichnis (Shares per --share oder interaktiv)."""
-    if self_test:
-        try:
-            ok = bc.self_test()
-        except Exception as exc:  # noqa: BLE001
-            ctx.fail(f"Selbsttest fehlgeschlagen: {exc}", exit_code=1)
-            return
-        ctx.emit_json({"result": "PASS" if ok else "FAIL"})
-        ctx.echo("[OK] Selbsttest bestanden." if ok else "[FAIL] -> [FEHLER] Selbsttest fehlgeschlagen.")
-        if not ok:
-            ctx.fail("Selbsttest fehlgeschlagen.", exit_code=1)
-        return
-
-    if not backup_dir:
-        ctx.fail("Backup-Verzeichnis erforderlich, außer bei --self-test.")
-        return
-
-    share_list = list(shares)
-    if not share_list:
-        ctx.echo("Shares eingeben (leere Zeile zum Abschließen):")
-        while True:
-            line = click.prompt("Share", default="", show_default=False)
-            if not line:
-                break
-            share_list.append(line.strip())
-
-    try:
-        bc.real_drill(backup_dir, share_list)
-    except bc.BackupError as exc:
-        ctx.fail(f"Drill fehlgeschlagen: {exc}", exit_code=1)
-        return
-
-    ctx.emit_json({"result": "PASS"})
-    ctx.echo("[OK] Drill bestanden, protokolliert in ~/.pico_hsm/recovery_drills.jsonl")
 
 
 @backup.command("list")
@@ -157,15 +35,141 @@ def list_cmd(ctx: CliContext, parent_dir: Path) -> None:
 
     for info in infos:
         ctx.echo(f"\n{info.path}")
-        ctx.echo(f"  Erstellt:        {info.created_at or '?'}")
-        ctx.echo(f"  Schema:          {info.threshold}-von-{info.total_shares}")
+        created = info.created_at or "?"
+        if info.age_days is not None:
+            created = f"{created} (vor {info.age_days} Tagen)"
+        ctx.echo(f"  Erstellt:        {created}")
+        ctx.echo(f"  Schema:          {backup_index.schema_text(info)}")
         ctx.echo(f"  Ciphertext-SHA:  {info.ciphertext_sha256 or '?'}")
-        if info.leftover_shares_file_present:
-            ctx.echo(
-                "  [WARN] shares-DO-NOT-KEEP-TOGETHER.txt liegt noch hier — "
-                "Gesamt-Secret an einem Ort, nach Drill löschen!"
-            )
-        if info.last_drill_at:
-            ctx.echo(f"  Letzter Drill:   {info.last_drill_at} -> {info.last_drill_result}")
-        else:
-            ctx.echo("  Letzter Drill:   noch nie getestet — Drill empfohlen!")
+        ctx.echo(f"  Letzter Drill:   {backup_index.drill_text(info)}")
+        ctx.echo(f"  Hygiene:         {backup_index.hygiene_label(info)}")
+        for warning in backup_index.hygiene_warnings(info):
+            ctx.echo(f"  [WARN] {warning}")
+
+
+def _hsm_parts(keys: bool, data: bool, options: bool, all_parts: bool) -> list[str]:
+    """Auswahl auflösen: --all (Default) oder einzelne Checkboxen."""
+    if all_parts or not (keys or data or options):
+        return list(hb.PARTS)
+    selected = []
+    if keys:
+        selected.append("keys")
+    if data:
+        selected.append("data")
+    if options:
+        selected.append("options")
+    return selected
+
+
+def _key_ref_overrides(raw: tuple[str, ...]) -> dict[str, int]:
+    """LABEL:REF-Paare parsen (manueller Key-Reference-Override)."""
+    overrides: dict[str, int] = {}
+    for item in raw:
+        if ":" not in item:
+            raise ValueError(
+                f"Ungültig (erwartet LABEL:REF): {item!r}.")
+        label, _, ref = item.partition(":")
+        try:
+            overrides[label.strip()] = int(ref.strip())
+        except ValueError:
+            raise ValueError(
+                f"Ungültig (REF muss Zahl sein): {item!r}.")
+    return overrides
+
+
+@backup.command("hsm-backup")
+@click.argument("out_dir", type=click.Path(path_type=Path))
+@click.option("--all", "all_parts", is_flag=True, default=True,
+              help="Vollbackup (alle Teile, Default).")
+@click.option("--keys/--no-keys", default=True, help="Keys per DKEK-Wrap sichern.")
+@click.option("--data/--no-data", default=True, help="Datenobjekte sichern.")
+@click.option("--options/--no-options", default=True, help="Dynamic Options sichern.")
+@click.option("--recipient", "recipients", multiple=True, required=True,
+              help="Empfänger-Pubkey (mehrfach, 1-aus-n).")
+@click.option("--key-ref", "key_refs", multiple=True,
+              help="Manueller Key-Reference-Override (LABEL:REF, mehrfach).")
+@pass_ctx
+def hsm_backup_cmd(ctx: CliContext, out_dir: Path, all_parts: bool,
+                   keys: bool, data: bool, options: bool,
+                   recipients: tuple[str, ...],
+                   key_refs: tuple[str, ...]) -> None:
+    """Echtes HSM-Backup: Token-Inhalt sichern (nicht nur Dateien).
+
+    Braucht DKEK mit Shares (sonst Abbruch mit Anleitung) und die
+    User-PIN (--pin-env oder Prompt). Versiegelung per Empfänger
+    (--recipient, mehrfach, 1-aus-n). PINs, DKEK und OTP migrieren nie
+    (siehe Doku) — nur Keys, Daten und Optionen landen im Bundle.
+    """
+    parts = _hsm_parts(keys, data, options, all_parts)
+    try:
+        overrides = _key_ref_overrides(key_refs)
+    except ValueError as exc:
+        ctx.fail(str(exc))
+        return
+    pin = ctx.get_pin()
+    try:
+        hb.check_dkek_ready()
+        inventory = hb.collect_inventory(pin, ctx.serial, ctx.pkcs11_lib)
+        staging = out_dir / ".hsm-staging"
+        manifest = hb.export_parts(
+            inventory, parts, staging, pin, ctx.serial, ctx.pkcs11_lib,
+            overrides)
+        sealed = hb.seal_bundle(staging, out_dir, list(recipients))
+    except hb.HsmBackupError as exc:
+        ctx.fail(str(exc), exit_code=2)
+        return
+    ctx.emit_json({"status": "ok", "parts": parts,
+                   "keys": [k["label"] for k in manifest.keys],
+                   "pubkey": sealed.get("pubkey")})
+    ctx.echo(f"[OK] HSM-Backup nach {out_dir} ({', '.join(parts)}).")
+    ctx.echo(f"  Keys: {len(manifest.keys)}, Daten: {len(manifest.data_objects)}.")
+    ctx.echo(
+        f"  Empfänger-Modus ({len(sealed['recipients'])} Empfänger, "
+        "1-aus-n) — Datei an alle Standorte verteilen.")
+
+
+@backup.command("hsm-restore")
+@click.argument("backup_dir", type=click.Path(exists=True, path_type=Path))
+@click.option("--identity-file", type=click.Path(exists=True, path_type=Path),
+              required=True,
+              help="Identity-Datei eines Empfängers.")
+@click.option("--work-dir", type=click.Path(path_type=Path), default=None,
+              help="Arbeitsverzeichnis (Default: Unterordner im Backup).")
+@click.option("--force", "force_flag", is_flag=True,
+              help="Unwrap auf belegte References erzwingen.")
+@pass_ctx
+def hsm_restore_cmd(ctx: CliContext, backup_dir: Path,
+                    identity_file: Path,
+                    work_dir: Path | None, force_flag: bool) -> None:
+    """HSM-Backup auf (neuer) Hardware wiederherstellen.
+
+    Voraussetzung: Token initialisiert + derselbe DKEK per Shares
+    importiert (User-PIN/SO-PIN neu vergeben). Danach Unwrap, Daten,
+    Optionen + Verifikation gegen Manifest (Key-References stehen im
+    Manifest, kein Override nötig).
+    """
+    pin = ctx.get_pin()
+    work = work_dir or (backup_dir / ".hsm-restore-work")
+    try:
+        bundle_zip = hb.open_sealed_bundle(
+            backup_dir, work, identity_file)
+        report, manifest_dict = hb.apply_bundle(
+            bundle_zip, pin, ctx.serial, ctx.pkcs11_lib,
+            force=ctx.force or force_flag)
+        verification = hb.verify_against_manifest(
+            hb.HsmManifest.from_dict(manifest_dict),
+            pin, ctx.serial, ctx.pkcs11_lib)
+    except hb.HsmBackupError as exc:
+        ctx.fail(str(exc), exit_code=2)
+        return
+    ctx.emit_json({"status": "ok", "report": report,
+                   "verification": verification})
+    ctx.echo(f"[OK] Wiederhergestellt: {len(report['keys'])} Keys, "
+             f"{len(report['data'])} Datenobjekte.")
+    for quirk in report.get("quirks", []):
+        ctx.echo(f"  [HINWEIS] {quirk}")
+    missing = verification["missing_keys"] + verification["missing_data"]
+    if missing:
+        ctx.echo(f"  [WARN] Fehlt nach Verifikation: {', '.join(missing)}.")
+    if verification["options_ok"] is False:
+        ctx.echo("  [WARN] Dynamic Options weichen vom Manifest ab.")

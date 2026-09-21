@@ -1,21 +1,14 @@
 """
-test_pkcs11_session.py — Tests für den kombinierten Konflikt-Check.
+test_pkcs11_session.py — Tests für Session-Handling und Konflikt-Check.
 
-Deckt ab: den weichen TCP-Erreichbarkeits-Check (mit echtem lokalen
-Listener, keine PKCS#11-Hardware nötig) und die Fehlertext-Konstruktion
-im harten Check (gemockte Session, keine echte Hardware).
-
-Besonderer Fokus: die Fehlermeldung darf keine Kausalität zum Gateway
-unterstellen, die im Betriebsmodell "HSM wandert zwischen Hosts" (App
-verwaltet per USB, Gateway läuft woanders) gar nicht gegeben sein kann
-— siehe Modul-Docstring in pkcs11_session.py.
+Deckt ab: Lib-Pfad-Auswahl, Token-Serial-Formatierung, Token-Auswahl
+und die Fehlertext-Konstruktion im harten Check (gemockte Session,
+keine echte Hardware).
 """
 
 from __future__ import annotations
 
-import socket
-import threading
-from contextlib import closing
+import platform
 from unittest.mock import MagicMock, patch
 
 import pkcs11
@@ -24,49 +17,76 @@ import pytest
 from pico_hsm_tools import pkcs11_session as ps
 
 
-# --- check_gateway_reachable ---------------------------------------------
+# --- default_pkcs11_lib_path (Windows-Fallback-Kette) --------------------------
 
-def test_no_host_or_port_is_never_reachable_without_error():
-    assert ps.check_gateway_reachable(None, None) == ps.GatewayState(False, None, None)
-    assert ps.check_gateway_reachable("host", None) == ps.GatewayState(False, "host", None)
+class _FakePath:
+    """Path-Ersatz für Kandidaten-Tests (existiert nur wo gewünscht)."""
+
+    existing: set = set()
+
+    def __init__(self, path):
+        self._path = path
+
+    def exists(self):
+        return self._path in _FakePath.existing
 
 
-def test_reachable_with_real_listener():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
-    srv.settimeout(0.2)
-    port = srv.getsockname()[1]
-    stop = threading.Event()
-
-    def accept_loop():
-        while not stop.is_set():
-            try:
-                conn, _ = srv.accept()
-                conn.close()
-            except OSError:
-                pass
-
-    t = threading.Thread(target=accept_loop, daemon=True)
-    t.start()
+def test_windows_lib_prefers_existing_candidate(monkeypatch):
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(ps, "Path", _FakePath)
+    _FakePath.existing = {
+        r"C:\Program Files\OpenSC Project\OpenSC\pkcs11\opensc-pkcs11.dll"
+    }
     try:
-        state = ps.check_gateway_reachable("127.0.0.1", port)
-        assert state.reachable is True
+        assert ps.default_pkcs11_lib_path() == (
+            r"C:\Program Files\OpenSC Project\OpenSC\pkcs11\opensc-pkcs11.dll"
+        )
     finally:
-        stop.set()
-        srv.close()
-        t.join(timeout=1)
+        _FakePath.existing = set()
 
 
-def test_not_reachable_when_nothing_listens():
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-        s.bind(("127.0.0.1", 0))
-        free_port = s.getsockname()[1]
-    state = ps.check_gateway_reachable("127.0.0.1", free_port, timeout=0.2)
-    assert state.reachable is False
+def test_windows_lib_falls_back_to_first_candidate(monkeypatch):
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(ps, "Path", _FakePath)
+    _FakePath.existing = set()
+    try:
+        assert ps.default_pkcs11_lib_path() == ps._WINDOWS_PKCS11_CANDIDATES[0]
+    finally:
+        _FakePath.existing = set()
 
 
-# --- exclusive_session: Fehlertext darf keine Kausalität unterstellen ----
+def test_non_windows_lib_paths_unchanged(monkeypatch):
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    assert ps.default_pkcs11_lib_path() == ps.DEFAULT_PKCS11_LIB_LINUX
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    assert ps.default_pkcs11_lib_path() == ps.DEFAULT_PKCS11_LIB_MACOS
+
+
+# --- format_token_serial (Hardware-Befunde Ersatzboard) -------------------------
+
+def test_format_token_serial_printable_bytes():
+    assert ps.format_token_serial(b"ESPICOHSMTR") == "ESPICOHSMTR"
+
+
+def test_format_token_serial_zeroed_bytes_becomes_hex():
+    raw = b"\x00" * 16
+    assert ps.format_token_serial(raw) == "00" * 16
+
+
+def test_format_token_serial_non_ascii_bytes_becomes_hex():
+    assert ps.format_token_serial(b"\xff\xfe") == "fffe"
+
+
+def test_format_token_serial_str_passthrough():
+    assert ps.format_token_serial("  ABC123  ") == "ABC123"
+
+
+def test_format_token_serial_other_types():
+    assert ps.format_token_serial(None) == "None"
+    assert ps.format_token_serial(123) == "123"
+
+
+# --- exclusive_session: Belegt-Fehlermeldung ---------------------------------------
 
 def _make_failing_token(exc: Exception):
     token = MagicMock()
@@ -76,7 +96,7 @@ def _make_failing_token(exc: Exception):
     return token
 
 
-def test_session_conflict_message_without_gateway_config():
+def test_session_conflict_message_mentions_busy_reader():
     failing = _make_failing_token(pkcs11.exceptions.DeviceError("boom"))
     with patch.object(ps, "get_token", return_value=failing):
         with pytest.raises(ps.SessionConflictError) as excinfo:
@@ -84,64 +104,8 @@ def test_session_conflict_message_without_gateway_config():
                 pass
     msg = str(excinfo.value)
     assert "belegten Reader" in msg
-    assert "Keine Gateway-Adresse konfiguriert" in msg
-
-
-def test_session_conflict_message_does_not_overclaim_when_reachable():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
-    srv.settimeout(0.2)
-    port = srv.getsockname()[1]
-    stop = threading.Event()
-
-    def accept_loop():
-        while not stop.is_set():
-            try:
-                conn, _ = srv.accept()
-                conn.close()
-            except OSError:
-                pass
-
-    t = threading.Thread(target=accept_loop, daemon=True)
-    t.start()
-    try:
-        failing = _make_failing_token(pkcs11.exceptions.TokenNotPresent("boom"))
-        with patch.object(ps, "get_token", return_value=failing):
-            with pytest.raises(ps.SessionConflictError) as excinfo:
-                with ps.exclusive_session(
-                    "1234", gateway_host="127.0.0.1", gateway_port=port,
-                ):
-                    pass
-    finally:
-        stop.set()
-        srv.close()
-        t.join(timeout=1)
-
-    msg = str(excinfo.value)
-    assert "erreichbar" in msg
-    # Keine unterstellte Kausalität zum Gateway (Regressionstest für den
-    # Sebastian-Fix: "HSM wandert zwischen Hosts" macht die alte
-    # Formulierung "möglicherweise belegt es den Reader" irreführend):
-    assert "möglicherweise belegt" not in msg
-    assert "vermutlich" not in msg
-    # Stattdessen der Hinweis auf die Einschränkung der Aussagekraft:
-    assert "nur aussagekräftig" in msg
-
-
-def test_session_conflict_message_when_gateway_unreachable():
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-        s.bind(("127.0.0.1", 0))
-        free_port = s.getsockname()[1]
-    failing = _make_failing_token(pkcs11.exceptions.SessionCount("boom"))
-    with patch.object(ps, "get_token", return_value=failing):
-        with pytest.raises(ps.SessionConflictError) as excinfo:
-            with ps.exclusive_session(
-                "1234", gateway_host="127.0.0.1", gateway_port=free_port,
-            ):
-                pass
-    msg = str(excinfo.value)
-    assert "nicht erreichbar" in msg
+    assert "DeviceError" in msg
+    assert "Gateway" not in msg
 
 
 def test_non_conflict_errors_propagate_unchanged():

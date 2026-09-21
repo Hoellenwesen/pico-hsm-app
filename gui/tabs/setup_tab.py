@@ -1,27 +1,33 @@
-"""setup_tab.py — Setup-Bereich (Schritt 6b: zweiter ausgebauter Tab).
+"""setup_tab.py — Setup-Bereich (ausgebauter Tab).
 
-Drei Sektionen wie CLI `setup show` / `setup datetime` /
-`setup dynamic-options`: OTP-Anzeige (read-only, picotool über
-flash_core.py), RTC-Datetime (apdu_core.py), Dynamic Options
+Zwei Sektionen wie CLI `setup show` / `setup dynamic-options`:
+OTP-Anzeige (read-only, picotool über flash_core.py), Dynamic Options
 (apdu_core.py). Ein FunctionWorker pro Vorgang; Fehler pro Sektion
 blockieren einander nicht und erscheinen als inline InfoBar.
 
-Schreibaktionen (Datetime setzen, Options anwenden) verlangen einen
-Confirm-Dialog; das Deaktivieren von Press-to-Confirm bekommt einen
-verschärften Warntext (Konzept §9). APDU-Verbindungen werden im Worker
-geöffnet/geschlossen (nie UI-Thread, sequenziell/exklusiv-Regel §7.b).
+VORAUSSETZUNG für Dynamic Options (Firmware, am Board gemessen):
+vorheriger PIN-Login, sonst antwortet die Karte SW=6982 — Hinweis
+steht an der Sektion (z.B. Keys-Tab mit PIN nutzen, Session danach
+schließen, sequenziell/exklusiv-Regel §7.b).
+
+Schreibaktion (Options anwenden) verlangt einen Confirm-Dialog; das
+Deaktivieren von Press-to-Confirm bekommt einen verschärften Warntext
+(Konzept §9). APDU-Verbindungen werden im Worker geöffnet/geschlossen
+(nie UI-Thread).
+
+Entfernt (Hardware-Befund, Firmware v6.6 implementiert kein
+RTC-Datetime-Kommando — Karte antwortet 6A86): die frühere
+Datetime-Sektion. extra_command.md beschreibt hier Firmware-Fiktion.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
-from PySide6.QtCore import QDateTime, QThreadPool
+from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QHBoxLayout, QTableWidgetItem, QVBoxLayout, QWidget
 from qfluentwidgets import (
     BodyLabel,
-    DateTimeEdit,
     InfoBar,
     InfoBarPosition,
     PrimaryPushButton,
@@ -32,14 +38,14 @@ from qfluentwidgets import (
     TitleLabel,
 )
 
-from gui.session_helpers import confirm_destructive
+from gui.session_helpers import close_info_bars, confirm_destructive
 from gui.workers import FunctionWorker
 from pico_hsm_tools import apdu_core as ac
 from pico_hsm_tools import flash_core as fc
 
 
 def _query_setup() -> dict[str, Any]:
-    """OTP + Datetime + Options einsammeln (läuft im Worker-Thread)."""
+    """OTP + Options einsammeln (läuft im Worker-Thread)."""
     errors: list[str] = []
 
     try:
@@ -54,13 +60,11 @@ def _query_setup() -> dict[str, Any]:
     try:
         conn = ac.open_connection()
         try:
-            current_dt = ac.get_datetime(conn)
             current_options = ac.get_dynamic_options(conn)
         finally:
             conn.disconnect()
         apdu_error: str | None = None
     except Exception as exc:  # noqa: BLE001 — als InfoBar, kein Abbruch
-        current_dt = None
         current_options = None
         apdu_error = f"Token nicht erreichbar ({exc})."
         errors.append(apdu_error)
@@ -68,22 +72,10 @@ def _query_setup() -> dict[str, Any]:
     return {
         "fingerprint": fingerprint,
         "otp_flags": otp_flags,
-        "datetime": current_dt.isoformat(timespec="seconds") if current_dt else None,
         "press_to_confirm": current_options.press_to_confirm if current_options else None,
         "key_usage_counter": current_options.key_usage_counter if current_options else None,
         "errors": errors,
     }
-
-
-def _do_set_datetime(iso_value: str) -> str:
-    """RTC-Datetime setzen (läuft im Worker-Thread). Gibt ISO zurück."""
-    value = datetime.fromisoformat(iso_value)
-    conn = ac.open_connection()
-    try:
-        ac.set_datetime(conn, value)
-    finally:
-        conn.disconnect()
-    return value.isoformat(timespec="seconds")
 
 
 def _do_set_options(press_to_confirm: bool, key_usage_counter: bool) -> dict[str, bool]:
@@ -101,7 +93,10 @@ def _do_set_options(press_to_confirm: bool, key_usage_counter: bool) -> dict[str
 
 
 class SetupTab(QWidget):
-    """Setup-Tab: OTP-Anzeige, RTC-Datetime, Dynamic Options."""
+    """Setup-Tab: OTP-Anzeige (nur BOOTSEL), Dynamic Options (nur Normal)."""
+
+    BOOTSEL_SECTION_TIP = "Nur im BOOTSEL-Modus nutzbar (picotool OTP)."
+    NORMAL_SECTION_TIP = "Nur im Normal-Modus nach PIN-Login nutzbar."
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -113,15 +108,18 @@ class SetupTab(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(TitleLabel("Setup", self))
 
-        # --- OTP ------------------------------------------------------
+        # --- OTP (nur BOOTSEL) ------------------------------------------
         otp_head = QHBoxLayout()
-        otp_head.addWidget(StrongBodyLabel("Secure Boot / OTP", self))
+        otp_head.addWidget(StrongBodyLabel("Secure Boot / OTP (BOOTSEL)", self))
         otp_head.addStretch(1)
         self.setupRefreshButton = PrimaryPushButton("Aktualisieren", self)
         self.setupRefreshButton.setObjectName("setupRefreshButton")
         self.setupRefreshButton.clicked.connect(self.refresh)
         otp_head.addWidget(self.setupRefreshButton)
         layout.addLayout(otp_head)
+        self.otpModeHint = BodyLabel("", self)
+        self.otpModeHint.setObjectName("otpModeHint")
+        layout.addWidget(self.otpModeHint)
         self.fingerprintLabel = BodyLabel("Noch nicht abgefragt.", self)
         self.fingerprintLabel.setObjectName("fingerprintLabel")
         layout.addWidget(self.fingerprintLabel)
@@ -132,29 +130,16 @@ class SetupTab(QWidget):
         self.otpTable.setEditTriggers(TableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.otpTable)
 
-        # --- Datetime -------------------------------------------------
-        layout.addWidget(StrongBodyLabel("RTC-Datetime", self))
-        self.datetimeCurrentLabel = BodyLabel("Noch nicht abgefragt.", self)
-        self.datetimeCurrentLabel.setObjectName("datetimeCurrentLabel")
-        layout.addWidget(self.datetimeCurrentLabel)
-        datetime_row = QHBoxLayout()
-        self.datetimeEdit = DateTimeEdit(self)
-        self.datetimeEdit.setObjectName("datetimeEdit")
-        self.datetimeEdit.setDateTime(QDateTime.currentDateTime())
-        self.datetimeEdit.setCalendarPopup(True)
-        self.nowButton = PushButton("Jetzt", self)
-        self.nowButton.setObjectName("nowButton")
-        self.nowButton.clicked.connect(self._fill_now)
-        self.datetimeSetButton = PrimaryPushButton("Setzen", self)
-        self.datetimeSetButton.setObjectName("datetimeSetButton")
-        self.datetimeSetButton.clicked.connect(self._on_set_datetime)
-        datetime_row.addWidget(self.datetimeEdit, 1)
-        datetime_row.addWidget(self.nowButton)
-        datetime_row.addWidget(self.datetimeSetButton)
-        layout.addLayout(datetime_row)
-
-        # --- Dynamic Options ------------------------------------------
-        layout.addWidget(StrongBodyLabel("Dynamic Options", self))
+        # --- Dynamic Options (nur Normal + PIN-Login) ---------------------
+        layout.addWidget(StrongBodyLabel("Dynamic Options (Normal)", self))
+        self.dynoptsModeHint = BodyLabel("", self)
+        self.dynoptsModeHint.setObjectName("dynoptsModeHint")
+        layout.addWidget(self.dynoptsModeHint)
+        layout.addWidget(BodyLabel(
+            "Voraussetzung: vorheriger PIN-Login (z.B. Keys-Tab), "
+            "sonst antwortet die Karte SW=6982.",
+            self,
+        ))
         options_row = QHBoxLayout()
         self.ptcSwitch = SwitchButton("Press-to-Confirm", self)
         self.ptcSwitch.setObjectName("ptcSwitch")
@@ -171,13 +156,31 @@ class SetupTab(QWidget):
 
         layout.addStretch(0)
 
+    def apply_device_mode(self, mode: object, _state: object = None) -> None:
+        """Sektionen je Modus sperren (strikt, mit Hinweis statt Blind-Fehler)."""
+        from pico_hsm_tools.device_mode import DeviceMode
+
+        bootsel = mode == DeviceMode.BOOTSEL
+        normal = mode == DeviceMode.NORMAL
+        for widget in (self.fingerprintLabel, self.otpTable):
+            widget.setEnabled(bootsel)
+            widget.setToolTip("" if bootsel else self.BOOTSEL_SECTION_TIP)
+        self.otpModeHint.setText(
+            "" if bootsel else f"Deaktiviert — {self.BOOTSEL_SECTION_TIP}"
+        )
+        for widget in (self.ptcSwitch, self.counterSwitch, self.dynoptsApplyButton):
+            widget.setEnabled(normal)
+            widget.setToolTip("" if normal else self.NORMAL_SECTION_TIP)
+        self.dynoptsModeHint.setText(
+            "" if normal else f"Deaktiviert — {self.NORMAL_SECTION_TIP}"
+        )
+        self.setupRefreshButton.setEnabled(bootsel or normal)
+
     # --- Laden -----------------------------------------------------------
 
     def refresh(self) -> None:
         """Alle Sektionen neu abfragen (Button + Tab-Wechsel)."""
-        for bar in self._info_bars:
-            bar.close()
-        self._info_bars.clear()
+        close_info_bars(self._info_bars)
 
         self.setupRefreshButton.setEnabled(False)
         self._worker = FunctionWorker(_query_setup)
@@ -207,12 +210,6 @@ class SetupTab(QWidget):
             self.otpTable.setItem(row, 0, QTableWidgetItem(name))
             self.otpTable.setItem(row, 1, QTableWidgetItem(value))
 
-        current_dt = result["datetime"]
-        self.datetimeCurrentLabel.setText(
-            f"Aktuell: {current_dt.replace('T', ' ')}"
-            if current_dt is not None else "Aktuell: nicht lesbar."
-        )
-
         self._current_ptc = result["press_to_confirm"]
         if self._current_ptc is not None:
             self.ptcSwitch.setChecked(self._current_ptc)
@@ -230,34 +227,6 @@ class SetupTab(QWidget):
         self._show_error(f"Unerwarteter Fehler ({exc}).")
 
     # --- Schreiben ---------------------------------------------------------
-
-    def _fill_now(self) -> None:
-        self.datetimeEdit.setDateTime(QDateTime.currentDateTime())
-
-    def _on_set_datetime(self) -> None:
-        value = self.datetimeEdit.dateTime().toPython()
-        if not confirm_destructive(
-            self,
-            "RTC-Datetime setzen",
-            f"Token-Uhr auf {value.strftime('%Y-%m-%d %H:%M:%S')} setzen?",
-        ):
-            return
-        self.datetimeSetButton.setEnabled(False)
-        worker = FunctionWorker(_do_set_datetime, value.isoformat(timespec="seconds"))
-        worker.signals.finished.connect(self._on_set_finished)
-        worker.signals.error.connect(self._on_set_failed)
-        self._worker = worker
-        QThreadPool.globalInstance().start(worker)
-
-    def _on_set_finished(self, iso_value: str) -> None:
-        self.datetimeSetButton.setEnabled(True)
-        self._worker = None
-        self.datetimeCurrentLabel.setText(f"Aktuell: {iso_value.replace('T', ' ')}")
-
-    def _on_set_failed(self, exc: Exception) -> None:
-        self.datetimeSetButton.setEnabled(True)
-        self._worker = None
-        self._show_error(f"Datetime setzen fehlgeschlagen ({exc}).")
 
     def _on_apply_options(self) -> None:
         target_ptc = self.ptcSwitch.isChecked()

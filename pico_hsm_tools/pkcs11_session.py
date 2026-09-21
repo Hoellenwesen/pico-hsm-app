@@ -1,71 +1,55 @@
 """
 pkcs11_session.py — Session-Handling für die Config-App.
 
-Frühere Version prüfte vor jeder schreibenden Operation, ob ein lokaler
-`pico-hsm-daemon` (Unix-Socket) lief, und verlangte bei Konflikt eine
-Bestätigung, bevor sie stillschweigend trotzdem zugriff. Dieser Daemon
-ist laut `pico-hsm-api-connector/MIGRATION.md` inzwischen komplett durch
-das Gateway (mTLS-Netzwerkdienst, exklusiver PKCS#11-Konsument für
-sign/verify/encrypt/decrypt/derive) abgelöst — der alte Check prüfte
-also eine Komponente, die nicht mehr existiert.
+`exclusive_session()` öffnet schreibende Sessions direkt (rw +
+eingeloggt) — KEIN Vorab-Check, KEIN Override-Dialog: Schlägt das
+Öffnen mit einer Fehlerklasse fehl, die plausibel auf einen belegten
+Reader hindeutet, wird das als `SessionConflictError` neu geworfen —
+der Fehler ist zu dem Zeitpunkt bereits real aufgetreten, ein
+Bestätigungsdialog würde daran nichts ändern.
 
-Neuer, zweistufiger Ansatz (siehe Architekturkonzept §7.d):
+Hinweis zum Betrieb: Diese App und das HSM-API-Gateway laufen auf
+getrennten Systemen (Verwaltung per USB am Arbeitsplatzrechner,
+Gateway dauerhaft separat) — es gibt daher keinen gemeinsamen
+Reader und keinen app-seitigen Erreichbarkeits-Check mehr. Der
+komplette Zustand (PIN, Keys, DKEK-Shares) lebt auf dem
+Hardware-Token selbst.
 
-  1. WEICH — `check_gateway_reachable()`: reiner TCP-Connect-Versuch
-     gegen Host/Port des Gateways, sofort wieder getrennt. Kein
-     TLS-Handshake, keine authentifizierte Anfrage. Rein informativ,
-     blockiert nichts von sich aus.
-  2. HART — `exclusive_session()` versucht weiterhin direkt, die
-     PKCS#11-Session zu öffnen. Schlägt das mit einer Fehlerklasse fehl,
-     die plausibel auf einen belegten Reader hindeutet, wird das als
-     `SessionConflictError` neu geworfen — mit dem Ergebnis des weichen
-     Checks als zusätzlichem, ausdrücklich unsicherem Kontext.
-
-Anders als vorher gibt es dafür KEIN "trotzdem fortfahren" mehr: der
-alte Check war eine Heuristik VOR dem eigentlichen Zugriff (mit
-Override-Möglichkeit), der neue Fehler tritt erst auf, wenn das Öffnen
-der Session tatsächlich real fehlgeschlagen ist — ein Bestätigungsdialog
-würde daran nichts ändern.
-
-BETRIEBSMODELL-HINWEIS: Der weiche Check ist nur dann wirklich
-aussagekräftig, wenn App und Gateway sich denselben Reader am selben
-Host teilen (echte Ressourcenkonkurrenz möglich). Wandert das
-physische HSM stattdessen zwischen Hosts (z.B. Verwaltung an einem
-Arbeitsplatzrechner per USB, Gateway dauerhaft auf einem separaten
-System, HSM wird für Wartung umgesteckt), ist zu keinem Zeitpunkt mehr
-als ein PKCS#11-Konsument tatsächlich am Gerät — der komplette Zustand
-(PIN, Keys, DKEK-Shares) lebt auf dem Hardware-Token selbst, nicht auf
-einem der Hosts. Der Check bleibt dann technisch nutzbar, aber seine
-Aussagekraft über eine tatsächliche Gerätekonkurrenz sinkt gegen null.
-Die Fehlermeldung unten formuliert das entsprechend vorsichtig, statt
-eine Kausalität zum Gateway zu unterstellen, die es in diesem Betriebs-
-modell so nicht gibt.
-
-OFFENER PUNKT (Architekturkonzept §12): welche konkrete
-Exception-Klasse `python-pkcs11` wirft, wenn ein zweiter Prozess
-exklusiv auf denselben Reader zugreift, ist NICHT gegen echte Hardware
-mit zwei parallelen Prozessen verifiziert. `_LIKELY_CONFLICT_ERRORS`
-unten ist eine begründete Auswahl (siehe Kommentar dort), keine
-verifizierte Zuordnung — nach dem ersten Hardwaretest ggf. anpassen.
+VERIFIZIERT (Architekturkonzept §12, docs/15 Phase 2.8, hw-logs/17):
+zweite exklusive Session + APDU bei gehaltener Session laufen
+störungsfrei — PKCS#11 kennt keinen OS-exklusiven Session-Lock.
+`_LIKELY_CONFLICT_ERRORS` unten bleibt als Sicherheitsnetz für echte
+Belegt-Fälle (seltener als ursprünglich angenommen).
 """
 
 from __future__ import annotations
 
-import socket
 from contextlib import contextmanager
-from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterator, Optional
 
 import pkcs11
 from pkcs11 import Token
-from pkcs11.exceptions import DeviceError, SessionCount, TokenNotPresent
+from pkcs11.exceptions import (
+    DeviceError,
+    MultipleTokensReturned,
+    NoSuchToken,
+    SessionCount,
+    TokenNotPresent,
+)
 
 DEFAULT_PKCS11_LIB_LINUX = "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so"
 DEFAULT_PKCS11_LIB_WINDOWS = r"C:\Windows\System32\opensc-pkcs11.dll"
 DEFAULT_PKCS11_LIB_MACOS = "/usr/local/lib/opensc-pkcs11.so"
 
-# Reiner TCP-Connect-Timeout für den weichen Erreichbarkeits-Check.
-DEFAULT_GATEWAY_TIMEOUT = 0.5
+# Windows-Fallback-Kette: Der OpenSC-MSI-Installer legt die DLL NICHT
+# nach System32 (alter Default), sondern nach <InstallDir>\pkcs11\.
+# Erster existierender Pfad gewinnt; sonst der alte Default (damit
+# Fehlermeldungen das bekannte Pfadbild behalten).
+_WINDOWS_PKCS11_CANDIDATES = (
+    DEFAULT_PKCS11_LIB_WINDOWS,
+    r"C:\Program Files\OpenSC Project\OpenSC\pkcs11\opensc-pkcs11.dll",
+)
 
 # Fehlerklassen, die plausibel auf einen belegten Reader/ein belegtes
 # Gerät hindeuten. Bewusst NICHT GeneralError/FunctionFailed: die sind
@@ -78,105 +62,126 @@ _LIKELY_CONFLICT_ERRORS = (DeviceError, TokenNotPresent, SessionCount)
 class SessionConflictError(Exception):
     """Wird geworfen, wenn das Öffnen einer schreibenden Session mit
     einer Fehlerklasse fehlschlägt, die auf einen aktuell belegten
-    Reader hindeutet (typischerweise: ein anderer Prozess, z.B. das
-    HSM-Gateway, hält gerade eine eigene Verbindung)."""
-
-
-@dataclass
-class GatewayState:
-    reachable: bool
-    host: Optional[str]
-    port: Optional[int]
-
-
-def check_gateway_reachable(
-    host: Optional[str],
-    port: Optional[int],
-    timeout: float = DEFAULT_GATEWAY_TIMEOUT,
-) -> GatewayState:
-    """Rein informativer Erreichbarkeits-Check: TCP-Connect versuchen,
-    sofort trennen. KEIN TLS-Handshake, KEINE authentifizierte Anfrage —
-    das Gateway erfordert Client-Zertifikate, die im
-    Management-Kontext dieser App nicht zwangsläufig vorhanden sind.
-    Sagt also nur "auf dem Port horcht etwas", nicht "das Gateway läuft
-    und funktioniert".
-
-    Werden host/port nicht übergeben (z.B. weil die Gateway-Config aus
-    Architekturkonzept §10 noch nicht existiert), liefert dies immer
-    reachable=False, ohne Fehler zu werfen — der Check ist rein additiv
-    und darf niemals einen Aufrufer blockieren, der (noch) keine
-    Gateway-Adresse konfiguriert hat.
-    """
-    if not host or not port:
-        return GatewayState(reachable=False, host=host, port=port)
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            pass
-        return GatewayState(reachable=True, host=host, port=port)
-    except OSError:
-        return GatewayState(reachable=False, host=host, port=port)
+    Reader hindeutet (typischerweise: ein anderer lokaler Prozess
+    hält gerade denselben USB-Reader offen)."""
 
 
 def default_pkcs11_lib_path() -> str:
     import platform
     system = platform.system()
     if system == "Windows":
-        return DEFAULT_PKCS11_LIB_WINDOWS
+        for candidate in _WINDOWS_PKCS11_CANDIDATES:
+            if Path(candidate).exists():
+                return candidate
+        return _WINDOWS_PKCS11_CANDIDATES[0]
     if system == "Darwin":
         return DEFAULT_PKCS11_LIB_MACOS
     return DEFAULT_PKCS11_LIB_LINUX
 
 
-def get_token(lib_path: Optional[str] = None) -> Token:
+def format_token_serial(raw: object) -> str:
+    """Token-Seriennummer anzeigbar (und JSON-fähig) machen.
+
+    Hardware-Befunde (Ersatzboard): leere/genullte Seriennummer kam als
+    rohe `bytes` (`b'\\x00...'`-Repr in der Anzeige; `json.dumps` würde
+    auf bytes sogar mit TypeError scheitern). Regeln: druckbares ASCII
+    (NUL-/Leer-Ränder weg) als Text, sonst Hex, str wie-ist-gestrippt,
+    Rest via `str()`.
+    """
+    if isinstance(raw, bytes):
+        try:
+            text = raw.decode("ascii")
+        except UnicodeDecodeError:
+            return raw.hex()
+        stripped = text.strip("\x00").strip()
+        if stripped and stripped.isprintable():
+            return stripped
+        return raw.hex()
+    if isinstance(raw, str):
+        return raw.strip()
+    return str(raw)
+
+
+def get_token(lib_path: Optional[str] = None, serial: Optional[str] = None) -> Token:
+    """Token holen, optional per Seriennummer gewählt (Mehrgeräte-Support).
+
+    Ohne `serial`: genau ein Token erwartet (Ein-Gerät-Modell). Bei
+    mehreren Tokens wirft dies MultipleTokensReturned mit Auswahl-
+    Anleitung (--serial) statt still das erste zu nehmen.
+    """
     lib = pkcs11.lib(lib_path or default_pkcs11_lib_path())
-    token = lib.get_token()
-    return token
+    if serial:
+        for token in lib.get_tokens():
+            if format_token_serial(token.serial) == serial:
+                return token
+        available = ", ".join(
+            format_token_serial(t.serial) for t in lib.get_tokens()
+        ) or "keine"
+        raise NoSuchToken(
+            f"Kein Token mit Seriennummer {serial!r} "
+            f"(verfügbar: {available})."
+        )
+    try:
+        return lib.get_token()
+    except MultipleTokensReturned as exc:
+        available = ", ".join(
+            format_token_serial(t.serial) for t in lib.get_tokens()
+        ) or "keine"
+        raise MultipleTokensReturned(
+            f"Mehrere Tokens erkannt (Seriennummern: {available}) — "
+            "bitte mit --serial <nummer> wählen."
+        ) from exc
+
+
+def list_tokens(lib_path: Optional[str] = None) -> list[dict]:
+    """Alle Tokens auflisten (Label/Modell/Seriennummer) — für Auswahl.
+
+    Rein lesend, ohne Login. Leere Liste bei keinem Token (wirft nicht).
+    """
+    lib = pkcs11.lib(lib_path or default_pkcs11_lib_path())
+    try:
+        tokens = list(lib.get_tokens())
+    except Exception:  # noqa: BLE001 — kein Token/DLL-Fehler = leere Liste
+        return []
+    return [
+        {
+            "label": token.label,
+            "model": token.model,
+            "serial": format_token_serial(token.serial),
+        }
+        for token in tokens
+    ]
 
 
 @contextmanager
 def exclusive_session(
     user_pin: str,
     lib_path: Optional[str] = None,
-    gateway_host: Optional[str] = None,
-    gateway_port: Optional[int] = None,
+    serial: Optional[str] = None,
 ) -> Iterator["pkcs11.Session"]:
     """Kontextmanager für schreibende Operationen.
 
-    Öffnet die PKCS#11-Session direkt — kein Vorab-Check mehr, der einen
-    fremden Prozess "gutartig" per Socket abfragt (das gibt es mit dem
-    Gateway nicht mehr auf dieselbe Art wie beim alten Daemon). Schlägt
-    das Öffnen mit einer der `_LIKELY_CONFLICT_ERRORS` fehl, wird das
-    als `SessionConflictError` neu geworfen, mit dem Ergebnis von
-    `check_gateway_reachable()` als zusätzlichem Kontext-Hinweis (siehe
-    dort für die Grenzen dieser Aussage).
+    "Exklusiv" heißt hier: schreibend (rw) + eingeloggt — KEIN
+    OS-/Treiber-Lock. Hardware-Befund (Ersatzboard, `hw-logs/17-...`):
+    parallele Sessions (zweiter Prozess, APDU daneben) funktionieren
+    störungsfrei; PKCS#11 kennt keinen exklusiven Session-Lock,
+    SmartCard-HSM/OpenSC serialisieren intern.
+
+    Öffnet die PKCS#11-Session direkt. Schlägt das Öffnen mit einer
+    der `_LIKELY_CONFLICT_ERRORS` fehl, wird das als
+    `SessionConflictError` neu geworfen (Sicherheitsnetz für echte
+    Belegt-Fälle — seltener als ursprünglich angenommen).
     """
-    token = get_token(lib_path)
+    token = get_token(lib_path, serial=serial)
     try:
         with token.open(user_pin=user_pin, rw=True) as session:
             yield session
     except _LIKELY_CONFLICT_ERRORS as exc:
-        gw = check_gateway_reachable(gateway_host, gateway_port)
-        if gw.host:
-            gw_hint = (
-                f"Gateway unter {gw.host}:{gw.port} ist "
-                f"{'erreichbar' if gw.reachable else 'nicht erreichbar'}. "
-                "Das ist nur aussagekräftig, falls App und Gateway auf "
-                "demselben Host laufen und sich denselben Reader teilen "
-                "— wandert das HSM stattdessen zwischen Hosts (z.B. "
-                "Verwaltung an einem Arbeitsplatzrechner, Gateway auf "
-                "einem separaten System), sagt diese Erreichbarkeit "
-                "nichts über die Ursache dieses Fehlers aus."
-            )
-        else:
-            gw_hint = (
-                "Keine Gateway-Adresse konfiguriert (--gateway-host/"
-                "--gateway-port)."
-            )
         raise SessionConflictError(
             f"Öffnen der Session fehlgeschlagen "
             f"({exc.__class__.__name__}: {exc}). Das deutet auf einen "
             f"belegten Reader hin — z.B. ein anderer lokaler Prozess, der "
-            f"gerade denselben USB-Reader offen hält. {gw_hint}"
+            f"gerade denselben USB-Reader offen hält."
         ) from exc
 
 
@@ -184,9 +189,10 @@ def exclusive_session(
 def read_only_session(
     user_pin: Optional[str] = None,
     lib_path: Optional[str] = None,
+    serial: Optional[str] = None,
 ) -> Iterator["pkcs11.Session"]:
     """Für reine Status-/Objektlisten-Abfragen. Rein lesende Zugriffe
     sind unkritischer, kein Conflict-Wrapping."""
-    token = get_token(lib_path)
+    token = get_token(lib_path, serial=serial)
     with token.open(user_pin=user_pin, rw=False) as session:
         yield session

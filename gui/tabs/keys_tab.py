@@ -1,4 +1,4 @@
-"""keys_tab.py — Schlüssel-Bereich (Schritt 6e: fünfter ausgebauter Tab).
+"""keys_tab.py — Schlüssel-Bereich.
 
 Alle acht CLI-Bereiche (`keys list/delete/import/generate/
 generate-aes/write-object/read-object/random`): Objektliste mit
@@ -7,9 +7,8 @@ AES-Erzeugung, Datenobjekte schreiben/lesen, Zufallszahlen.
 Core-Logik aus pico_hsm_tools/objects_core.py, Sessions über
 gui/session_helpers.py.
 
-Getroffene Entscheidungen (Schritt 6e): ein PIN-Feld pro Tab (gilt für
-alle Vorgänge, wird bei hideEvent geleert — Sessions brauchen die PIN
-wie im CLI), Inline-Sektionen, Lese-Hex-Vorschau + Speichern-Button.
+Getroffene Entscheidungen: PIN aus dem Vault (Anmeldung, kein Feld
+mehr), Inline-Sektionen, Lese-Hex-Vorschau + Speichern-Button.
 RSA-2048/4096-Warnung erscheint VORAB bei Auswahl (§7.a-Pflicht),
 Erzeugung läuft mit Fortschrittsanzeige im Worker.
 """
@@ -36,7 +35,6 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarPosition,
     LineEdit,
-    PasswordLineEdit,
     PrimaryPushButton,
     PushButton,
     StrongBodyLabel,
@@ -68,15 +66,6 @@ def _ask_save_path(parent: QWidget, caption: str) -> str | None:
     return path or None
 
 
-def _pin_field(parent: QWidget, name: str, placeholder: str) -> PasswordLineEdit:
-    """Strikt verdecktes PIN-Feld (Auge-Button versteckt — Entscheidung)."""
-    field = PasswordLineEdit(parent)
-    field.setObjectName(name)
-    field.setPlaceholderText(placeholder)
-    field.viewButton.hide()
-    return field
-
-
 class KeysTab(QWidget):
     """Schlüssel-Tab: Liste, Löschen, Import-Hinweis, Erzeugen (RSA/EC/AES),
     Datenobjekte schreiben/lesen, Zufallszahlen."""
@@ -90,11 +79,11 @@ class KeysTab(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(TitleLabel("Schlüssel", self))
 
-        # --- PIN (gilt für alle Vorgänge) --------------------------------
-        self.pinEdit = _pin_field(
-            self, "pinEdit", "User-PIN (für alle Vorgänge erforderlich)",
-        )
-        layout.addWidget(self.pinEdit)
+        # --- PIN (aus Anmeldung, kein Feld mehr) ---------------------------
+        self.pinStateLabel = BodyLabel("", self)
+        self.pinStateLabel.setObjectName("pinStateLabel")
+        self.pinStateLabel.setWordWrap(True)
+        layout.addWidget(self.pinStateLabel)
 
         # --- Objektliste ---------------------------------------------------
         list_head = QHBoxLayout()
@@ -271,9 +260,14 @@ class KeysTab(QWidget):
         layout.addStretch(0)
 
     def hideEvent(self, event) -> None:  # noqa: N802 (Qt-Konvention)
-        """PIN beim Verlassen des Tabs leeren (getroffene Entscheidung)."""
-        self.pinEdit.setText("")
+        """Beim Verlassen Vault-Hinweis auffrischen (PIN bleibt im Vault)."""
+        self._update_pin_state()
         super().hideEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt-Konvention)
+        """Beim Betreten Vault-Hinweis auffrischen."""
+        super().showEvent(event)
+        self._update_pin_state()
 
     # --- Helfer ------------------------------------------------------------
 
@@ -292,11 +286,27 @@ class KeysTab(QWidget):
         self._info_bars.append(bar)
 
     def _require_pin(self) -> str | None:
-        pin = self.pinEdit.text()
+        from gui.pin_vault import vault
+
+        pin = vault.get()
         if not pin:
-            self._show_error("User-PIN oben eingeben (für alle Vorgänge erforderlich).")
+            self._show_error(
+                "Gesperrt — bitte zuerst anmelden (Start-Tab)."
+            )
             return None
         return pin
+
+    def _update_pin_state(self) -> None:
+        """Vault-Hinweis aktualisieren (bei Tab-Wechsel + nach Aktionen)."""
+        from gui.pin_vault import vault
+
+        if vault.is_unlocked:
+            self.pinStateLabel.setText("Entsperrt — PIN aus Anmeldung aktiv.")
+        else:
+            self.pinStateLabel.setText(
+                "Gesperrt — bitte anmelden (Start-Tab), sonst sind alle "
+                "Vorgänge blockiert."
+            )
 
     @staticmethod
     def _parse_id(text: str) -> bytes | None:

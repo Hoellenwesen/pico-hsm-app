@@ -30,15 +30,13 @@ from .context import CliContext
 @click.option("--force", is_flag=True, help="Bestätigungen überspringen.")
 @click.option("--pin-env", default=None, help="Umgebungsvariable mit der HSM-PIN.")
 @click.option(
-    "--gateway-host", default=None,
-    help=(
-        "Hostname/IP des HSM-API-Gateways — nur für den rein "
-        "informativen Erreichbarkeits-Check (siehe `status gateway`, "
-        "Konflikt-Hinweise bei belegtem Reader). Ohne Angabe gilt das "
-        "Gateway als nicht erreichbar, blockiert aber nichts."
-    ),
+    "--serial", default=None,
+    help="Token-Seriennummer (bei mehreren Tokens wählen, siehe Status).",
 )
-@click.option("--gateway-port", default=None, type=int, help="Port des HSM-API-Gateways.")
+@click.option(
+    "--reader", default=None,
+    help="PC/SC-Reader-Name für APDU-Zugriff (`setup dynamic-options`).",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Debug-Ausgaben auf stderr.")
 @click.pass_context
 def cli(
@@ -47,8 +45,8 @@ def cli(
     json_output: bool,
     force: bool,
     pin_env: str | None,
-    gateway_host: str | None,
-    gateway_port: int | None,
+    serial: str | None,
+    reader: str | None,
     verbose: bool,
 ) -> None:
     """pico-hsm-cli — Setup, PIN/DKEK, Schlüssel, Backup, Firmware."""
@@ -57,8 +55,8 @@ def cli(
         json_output=json_output,
         force=force,
         pin_env=pin_env,
-        gateway_host=gateway_host,
-        gateway_port=gateway_port,
+        serial=serial,
+        reader=reader,
         verbose=verbose,
     )
 

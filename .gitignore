@@ -36,6 +36,7 @@ junit.xml
 .mypy_cache/
 .ruff_cache/
 .pyre/
+hw-logs/
 
 # --- IDE / Editor -----------------------------------------------------
 .vscode/
@@ -51,3 +52,10 @@ Desktop.ini
 
 # --- AI Stuff ---------------------------------------------------------
 pico-hsm-app-architektur-konzept.md
+
+# --- SENSIBEL: niemals committen (Key-Material aus HW-Tests) --------------
+*.wrap
+*.dkek
+hw-test.bin
+roundtrip.bin
+totp_secret.txt

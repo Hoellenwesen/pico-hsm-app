@@ -6,7 +6,6 @@ from getpass import getpass
 import click
 
 from ..context import CliContext, pass_ctx
-from ..pkcs11_helpers import warn_if_gateway_reachable
 
 
 @click.group()
@@ -63,8 +62,6 @@ def token(
     if not ctx.confirm("Wirklich initialisieren?"):
         ctx.fail("Abgebrochen.")
         return
-
-    warn_if_gateway_reachable(ctx)
 
     import os
     so_pin = os.environ.get(so_pin_env) if so_pin_env else None

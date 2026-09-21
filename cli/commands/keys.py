@@ -137,8 +137,9 @@ def generate(
     """RSA- oder EC-Keypair auf dem Gerät erzeugen (Private Key verlässt
     das HSM nie, intern verschlüsselt gespeichert).
 
-    ACHTUNG Laufzeit: RSA-2048 kann laut Firmware-Doku >20 Sekunden
-    dauern, RSA-4096 >20 Minuten — die CLI blockiert währenddessen.
+    ACHTUNG Laufzeit (am Board gemessen, Doku unzuverlässig):
+    RSA-2048 ca. 2:45 Minuten, RSA-4096 ca. 15:00 Minuten —
+    die CLI blockiert währenddessen.
     """
     if key_type == "rsa" and not bits:
         ctx.fail("--bits ist bei --type rsa erforderlich.")

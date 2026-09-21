@@ -1,16 +1,16 @@
 """
 test_cli_wiring.py — CLI-Integrations-Regressions­tests ohne Hardware.
 
-Deckt die Schritt-4-Lücken ab:
-  - `status all --json` emittiert EIN gültiges JSON-Dokument (statt drei
-    Fragmenten aus drei invoke-Aufrufen).
-  - `status all` im Textmodus ruft device/gateway/audit auf (unverändert).
+Deckt ab:
+  - `status all --json` emittiert EIN gültiges JSON-Dokument (statt
+    Fragmenten aus mehreren invoke-Aufrufen).
+  - `status all` im Textmodus ruft device/audit auf.
   - `keys import` hält die ctx-Konvention ein (kein rohes click.echo,
     JSON im --json-Modus).
 
 Hardware-Zugriffe werden auf Modulebene gemockt
-(_device_payload/_gateway_payload/_audit_payload); getestet wird die
-Verdrahtung, nicht die Firmware.
+(_device_payload/_audit_payload); getestet wird die Verdrahtung,
+nicht die Firmware.
 """
 
 from __future__ import annotations
@@ -33,35 +33,29 @@ def _fake_payloads(monkeypatch):
         lambda ctx: {"label": "T", "model": "M", "serial": "S"},
     )
     monkeypatch.setattr(
-        status_mod, "_gateway_payload",
-        lambda ctx: {"reachable": True, "host": "h", "port": 1},
-    )
-    monkeypatch.setattr(
         status_mod, "_audit_payload",
         lambda limit: {"chain_intact": True, "entries": []},
     )
 
 
 def test_status_all_json_is_single_document(monkeypatch):
-    """Regressionstest für die drei JSON-Fragmente: genau EIN Dokument."""
+    """Regressionstest für die JSON-Fragmente: genau EIN Dokument."""
     _fake_payloads(monkeypatch)
     runner = CliRunner()
     result = runner.invoke(cli, ["--json", "status", "all"])
     assert result.exit_code == 0, result.output
     doc = json.loads(result.output)  # wirft bei Fragmenten
-    assert set(doc) == {"device", "gateway", "audit"}
+    assert set(doc) == {"device", "audit"}
     assert doc["device"]["label"] == "T"
-    assert doc["gateway"]["reachable"] is True
     assert doc["audit"]["chain_intact"] is True
 
 
-def test_status_all_text_invokes_all_three(monkeypatch):
+def test_status_all_text_invokes_both(monkeypatch):
     _fake_payloads(monkeypatch)
     runner = CliRunner()
     result = runner.invoke(cli, ["status", "all"])
     assert result.exit_code == 0, result.output
     assert "Erkannt:" in result.output
-    assert "Gateway" in result.output
     assert "Hash-Chain" in result.output
 
 
@@ -94,6 +88,22 @@ def test_keys_import_json_is_json_only():
     doc = json.loads(result.output)  # wirft bei zusätzlichem Klartext
     assert doc["status"] == "ok"
     assert doc["hint"] == "dkek unwrap-key"
+
+
+def test_device_payload_serial_is_json_safe():
+    """Hardware-Befund: leere Seriennummer kam als bytes (Repr in Anzeige,
+    TypeError in --json). Payload enthält jetzt str."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    fake_token = SimpleNamespace(
+        label="", model="PKCS#15", serial=b"\x00" * 16,
+    )
+    ctx = CliContext()
+    with patch.object(status_mod, "get_token", return_value=fake_token):
+        payload = status_mod._device_payload(ctx)
+    assert payload["serial"] == "00" * 16
+    json.dumps(payload)  # darf nicht werfen
 
 
 # --- F4: PIN-Eingabe ohne TTY (Hang-Schutz) -------------------------------------

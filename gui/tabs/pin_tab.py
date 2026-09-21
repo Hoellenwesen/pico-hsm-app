@@ -1,10 +1,10 @@
-"""pin_tab.py — PIN-Bereich (Schritt 6c: dritter ausgebauter Tab).
+"""pin_tab.py — PIN-Bereich.
 
 Drei Sektionen wie CLI `pin change`/`unblock`/`status`: Ändern,
 Entsperren, Status. Core-Logik aus pico_hsm_tools/pin_core.py
 (pkcs11-tool-Subprozesse — python-pkcs11 hat keine PIN-API).
 
-Getroffene Entscheidungen (Schritt 6c): alle drei Sektionen, neue PIN
+Getroffene Entscheidungen: alle drei Sektionen, neue PIN
 zweimal (Abgleich wie CLI), strikt verdeckte Felder (QFluentWidgets
 PasswordLineEdit bringt einen eingebauten Auge-Button mit — wird hier
 bewusst versteckt, siehe _pin_field), Warn-InfoBar bei kritischem
@@ -33,6 +33,7 @@ from qfluentwidgets import (
     TitleLabel,
 )
 
+from gui.session_helpers import close_info_bars, selected_serial
 from gui.workers import FunctionWorker
 from pico_hsm_tools import pin_core as pc
 
@@ -48,7 +49,7 @@ def _pin_field(parent: QWidget, name: str) -> PasswordLineEdit:
 def _query_pin_flags() -> dict[str, Any]:
     """PIN-Status lesen (läuft im Worker-Thread)."""
     try:
-        flags = pc.read_pin_flags()
+        flags = pc.read_pin_flags(serial=selected_serial())
         error: str | None = None
     except Exception as exc:  # noqa: BLE001 — als InfoBar, kein Abbruch
         flags = None  # type: ignore[assignment]
@@ -58,12 +59,12 @@ def _query_pin_flags() -> dict[str, Any]:
 
 def _do_change(old_pin: str, new_pin: str) -> None:
     """User-PIN ändern (läuft im Worker-Thread)."""
-    pc.change_user_pin(old_pin, new_pin)
+    pc.change_user_pin(old_pin, new_pin, serial=selected_serial())
 
 
 def _do_unblock(so_pin: str, new_pin: str) -> None:
     """User-PIN entsperren (läuft im Worker-Thread)."""
-    pc.unblock_user_pin(so_pin, new_pin)
+    pc.unblock_user_pin(so_pin, new_pin, serial=selected_serial())
 
 
 class PinTab(QWidget):
@@ -80,13 +81,14 @@ class PinTab(QWidget):
 
         # --- Ändern ---------------------------------------------------
         layout.addWidget(StrongBodyLabel("User-PIN ändern", self))
-        self.oldPinEdit = _pin_field(self, "oldPinEdit")
-        self.oldPinEdit.setPlaceholderText("Aktuelle User-PIN")
+        layout.addWidget(BodyLabel(
+            "Alte PIN kommt aus der Anmeldung (Vault) — nur die neue "
+            "PIN hier zweimal eingeben.", self,
+        ))
         self.newPinEdit1 = _pin_field(self, "newPinEdit1")
         self.newPinEdit1.setPlaceholderText("Neue User-PIN")
         self.newPinEdit2 = _pin_field(self, "newPinEdit2")
         self.newPinEdit2.setPlaceholderText("Neue User-PIN bestätigen")
-        layout.addWidget(self.oldPinEdit)
         layout.addWidget(self.newPinEdit1)
         layout.addWidget(self.newPinEdit2)
         self.changeButton = PrimaryPushButton("Ändern", self)
@@ -133,9 +135,7 @@ class PinTab(QWidget):
 
     def refresh(self) -> None:
         """PIN-Status neu abfragen (Button + Tab-Wechsel)."""
-        for bar in self._info_bars:
-            bar.close()
-        self._info_bars.clear()
+        close_info_bars(self._info_bars)
 
         self.pinRefreshButton.setEnabled(False)
         self._worker = FunctionWorker(_query_pin_flags)
@@ -204,13 +204,19 @@ class PinTab(QWidget):
             field.setText("")
 
     def _on_change(self) -> None:
+        from gui.pin_vault import vault
+
+        old_pin = vault.get()
+        if not old_pin:
+            self._show_error("Gesperrt — bitte zuerst anmelden (Start-Tab).")
+            return
         values = self._read_pin_fields(
-            self.oldPinEdit, self.newPinEdit1, self.newPinEdit2,
+            self.newPinEdit1, self.newPinEdit2,
         )
         if values is None:
-            self._show_error("Alle drei PIN-Felder ausfüllen.")
+            self._show_error("Beide neuen PIN-Felder ausfüllen.")
             return
-        old_pin, new_pin, confirm_pin = values
+        new_pin, confirm_pin = values
         if new_pin != confirm_pin:
             self._show_error("Neue PINs stimmen nicht überein.")
             return
@@ -222,10 +228,13 @@ class PinTab(QWidget):
         QThreadPool.globalInstance().start(worker)
 
     def _on_change_finished(self, _result: None) -> None:
+        from gui.pin_vault import vault
+
         self.changeButton.setEnabled(True)
         self._worker = None
+        vault.unlock(self.newPinEdit1.text())
         self._clear_pin_fields(
-            self.oldPinEdit, self.newPinEdit1, self.newPinEdit2,
+            self.newPinEdit1, self.newPinEdit2,
         )
         self._show_success("PIN erfolgreich geändert.")
 
@@ -253,8 +262,11 @@ class PinTab(QWidget):
         QThreadPool.globalInstance().start(worker)
 
     def _on_unblock_finished(self, _result: None) -> None:
+        from gui.pin_vault import vault
+
         self.unblockButton.setEnabled(True)
         self._worker = None
+        vault.unlock(self.unblockNewPinEdit1.text())
         self._clear_pin_fields(
             self.soPinEdit, self.unblockNewPinEdit1, self.unblockNewPinEdit2,
         )

@@ -17,10 +17,10 @@ def dkek() -> None:
 
     Wichtig: das --pwd-shares-threshold/--pwd-shares-total-Schema von
     sc-hsm-tool splittet nur das Passwort EINES DKEK-Shares unter mehreren
-    Custodians. Es ist NICHT dasselbe wie das projekteigene Shamir/age-
-    Backup-Schema aus docs/09-backup-strategy.md für die PQC-Keys — beide
-    Mechanismen sind unabhängig voneinander und schützen unterschiedliche
-    Dinge (DKEK-Passwort vs. PQC-Private-Key-Export).
+    Custodians. Es ist NICHT dasselbe wie das Empfänger-Backup
+    (`backup hsm-backup`, age 1-aus-n) — beide Mechanismen sind
+    unabhängig voneinander und schützen unterschiedliche
+    Dinge (DKEK-Passwort vs. HSM-Token-Export).
     """
 
 
@@ -100,14 +100,23 @@ def wrap_key(ctx: CliContext, out_file: str, key_reference: int) -> None:
 @dkek.command("unwrap-key")
 @click.argument("wrapped_file", type=click.Path(exists=True))
 @click.option("--key-reference", "-r", required=True, type=int, help="Ziel-Key-Reference im Gerät.")
+@click.option(
+    "--force", is_flag=True,
+    help=(
+        "Belegte Reference ersetzen (reicht -f an sc-hsm-tool durch; "
+        "ohne das Flag verweigert das Tool den Import auf belegte Refs)."
+    ),
+)
 @pass_ctx
-def unwrap_key(ctx: CliContext, wrapped_file: str, key_reference: int) -> None:
+def unwrap_key(
+    ctx: CliContext, wrapped_file: str, key_reference: int, force: bool,
+) -> None:
     """Gewrappten Key wieder importieren (Gerät muss mit demselben DKEK
     initialisiert sein wie beim Export). Ersetzt das vorher separate
     `keys import` — das ist der reale Import-Mechanismus von Pico HSM."""
     pin = ctx.get_pin()
     try:
-        dc.unwrap_key(wrapped_file, key_reference, pin)
+        dc.unwrap_key(wrapped_file, key_reference, pin, force=force)
     except dc.DkekError as exc:
         ctx.fail(str(exc), exit_code=2)
         return

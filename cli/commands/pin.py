@@ -8,7 +8,6 @@ import click
 from pico_hsm_tools import pin_core as pc
 
 from ..context import CliContext, pass_ctx
-from ..pkcs11_helpers import warn_if_gateway_reachable
 
 
 @click.group()
@@ -27,7 +26,6 @@ def pin() -> None:
 @pass_ctx
 def change(ctx: CliContext) -> None:
     """User-PIN ändern (--change-pin, erfordert aktuelle User-PIN)."""
-    warn_if_gateway_reachable(ctx)
     old_pin = ctx.get_pin("Aktuelle User-PIN: ")
     new_pin = getpass("Neue User-PIN: ")
     confirm_pin = getpass("Neue User-PIN bestätigen: ")
@@ -36,7 +34,7 @@ def change(ctx: CliContext) -> None:
         return
 
     try:
-        pc.change_user_pin(old_pin, new_pin, ctx.pkcs11_lib)
+        pc.change_user_pin(old_pin, new_pin, ctx.pkcs11_lib, ctx.serial)
     except pc.PinError as exc:
         ctx.fail(str(exc), exit_code=2)
         return
@@ -55,7 +53,6 @@ def unblock(ctx: CliContext, puk_env: str | None) -> None:
     User-PIN bereits gesperrt ist — anders als --change-pin, das die
     aktuelle User-PIN voraussetzt.
     """
-    warn_if_gateway_reachable(ctx)
     so_pin = os.environ.get(puk_env) if puk_env else None
     if not so_pin:
         so_pin = getpass("SO-PIN: ")
@@ -66,7 +63,7 @@ def unblock(ctx: CliContext, puk_env: str | None) -> None:
         return
 
     try:
-        pc.unblock_user_pin(so_pin, new_pin, ctx.pkcs11_lib)
+        pc.unblock_user_pin(so_pin, new_pin, ctx.pkcs11_lib, ctx.serial)
     except pc.PinError as exc:
         ctx.fail(str(exc), exit_code=2)
         return
@@ -83,7 +80,7 @@ def pin_status(ctx: CliContext) -> None:
     der Status steckt in token.flags als TokenFlag-Bitmaske.
     """
     try:
-        payload = pc.read_pin_flags(ctx.pkcs11_lib)
+        payload = pc.read_pin_flags(ctx.pkcs11_lib, ctx.serial)
     except pc.PinError as exc:
         ctx.fail(str(exc), exit_code=2)
         return

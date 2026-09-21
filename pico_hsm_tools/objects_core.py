@@ -3,7 +3,7 @@ objects_core.py — Objekt-Lifecycle für Keys, Zertifikate und Datenobjekte.
 
 EINZIGE Quelle der Wahrheit für Objekt-Operationen (analog zu
 flash_core.py/backup_core.py) — sowohl cli/commands/keys.py als auch die
-künftige GUI (gui/tabs/keys_tab.py) importieren ausschließlich hieraus.
+GUI (gui/tabs/keys_tab.py) importieren ausschließlich hieraus.
 
 Konsolidiert außerdem die Objektliste/-löschung, die bisher inline in
 cli/commands/keys.py steckte (Bruch mit dem sonst durchgehaltenen
@@ -13,16 +13,16 @@ Deckt die in pico-hsm/doc/usage.md, aes.md und store_data.md
 dokumentierten Firmware-Funktionen ab, die die bisherige CLI nicht
 abbildete: Keypair-/AES-Erzeugung, Zertifikat-/Datenobjekte, RNG.
 Bewusst NICHT abgedeckt: sign/verify/encrypt/decrypt/derive (siehe
-gateway_client.py, geplanter Diagnose-Modus) und der DKEK-Wrap/Unwrap-
+gateway_client.py, Diagnose-Modus aus der Roadmap) und der DKEK-Wrap/Unwrap-
 Importpfad (bleibt bei dkek.py/sc-hsm-tool).
 
-OFFENE PUNKTE (Architekturkonzept §12): keine der Funktionen unten ist
-gegen echte Pico-HSM-Hardware verifiziert — usage.md/aes.md/store_data.md
-demonstrieren alles über pkcs11-tool/sc-hsm-tool als externe Programme,
-nicht über python-pkcs11. Insbesondere die Attribut-Zuordnung für
+HARDWARE-VERIFIKATION (§12, docs/15 Phase 2, alle abgehakt):
+Datenobjekt-Roundtrip byte-identisch inkl. Delete-Fix (CLASS-gefilterte
+Suche, hw-logs/07+08), EC-Roundtrip vollständig inkl. Paar-Löschung
+(hw-logs/09+10), RSA-2048 (ca. 2:45) und RSA-4096 (ca. 15:00) mit
+Timing-Messung (hw-logs/11+12). Die Attribut-Zuordnung für
 Datenobjekte (write_data_object) ist aus der dokumentierten
-pkcs11-tool-Ausgabe abgeleitet, nicht 1:1 aus der python-pkcs11-API-
-Referenz übernommen.
+pkcs11-tool-Ausgabe abgeleitet und per Roundtrip am Board belegt.
 
 WICHTIGER, REAL VERIFIZIERTER STOLPERSTEIN: Die Brainpool-Kurvennamen
 aus usage.md ("brainpoolP256r1", Groß-P wie bei OpenSC) matchen NICHT
@@ -47,13 +47,14 @@ from pkcs11.util.ec import encode_named_curve_parameters
 
 RSA_KEY_LENGTHS_BITS = (1024, 2048, 4096)
 
-# RSA-2048 kann laut usage.md >20s dauern, RSA-4096 >20min. Aufrufer
+# Laufzeiten am Ersatzboard gemessen (Doku lag bei 2048 um Faktor ~8
+# daneben): RSA-2048 ca. 2:45 Min., RSA-4096 ca. 15:00 Min. Aufrufer
 # (CLI/GUI) MÜSSEN das vor dem Aufruf anzeigen, nicht erst beim Timeout
 # entdecken — GUI-seitig zwingend in einem Worker-Thread ausführen
 # (siehe Architekturkonzept §8).
 RSA_SLOW_WARNING_BITS = {
-    2048: "kann länger als 20 Sekunden dauern",
-    4096: "kann länger als 20 Minuten dauern",
+    2048: "kann mehrere Minuten dauern (am Board gemessen: ca. 2:45 Min.)",
+    4096: "kann ca. eine Viertelstunde dauern (am Board gemessen: ca. 15:00 Min.)",
 }
 
 # Firmware-Doku-Namen (usage.md) -> asn1crypto/NamedCurve-kompatible
@@ -92,6 +93,19 @@ class ObjectInfo:
     object_class: str
     key_type: Optional[str] = None
     key_length_bits: Optional[int] = None
+
+
+def _display_name(value: object) -> str:
+    """Enum-Member auf Namen abbilden (statt Zahl).
+
+    Hardware-Befund (Ersatzboard): Seit Python 3.11 rendert
+    `str(IntEnum)` die ZAHL (`ObjectClass.PRIVATE_KEY` -> `"3"`) —
+    die Objektliste zeigte daher `3`/`2` statt Namen. `.name`
+    existiert auf allen Enum-Membern; alles andere (inkl. None ->
+    `"None"` wie bisher) fällt auf `str()` zurück.
+    """
+    name = getattr(value, "name", None)
+    return str(name if isinstance(name, str) else value)
 
 
 # --- Keypair-/AES-Erzeugung ----------------------------------------------
@@ -168,34 +182,82 @@ def generate_aes_key(
     )
 
 
-# --- Objekt-Liste/-Löschung (migriert aus cli/commands/keys.py) ---------
+# --- Objekt-Liste/-Löschung -------------------------------------------------
+# Hardware-Befund (Ersatzboard, Pico-HSM-Firmware v6.6/OpenSC): Eine
+# UNGEFILTERTE get_objects()-Suche liefert NICHT alle Objekte zurück
+# (nur ein System-PROFILE-Objekt; selbst angelegte Datenobjekte fehlen,
+# obwohl sie per gefilterter Suche lesbar sind). Deshalb arbeiten Liste
+# und Löschung mit expliziten CLASS-Filtern statt einer leeren Suche
+# plus Client-Vergleich — derselbe Mechanismus wie der funktionierende
+# Read-Pfad. Zertifikate sind EINGESCHLOSSEN (getroffene Entscheidung):
+# Key-Generierung legt Cert-Objekte an, die sonst unsichtbar den Import
+# blockieren (`Found existing certificate ... use --force`-Befund).
+
+# Reihenfolge mit Absicht: Geheimnisse zuerst (Private/Secret), dann
+# Daten, öffentliche Hälfte und Zertifikat zuletzt (harmloser Rest,
+# zweiter Aufruf entfernt ihn). Erster Treffer gewinnt (wie bisher).
+_DELETE_SEARCH_CLASSES = (
+    ObjectClass.PRIVATE_KEY,
+    ObjectClass.SECRET_KEY,
+    ObjectClass.DATA,
+    ObjectClass.PUBLIC_KEY,
+    ObjectClass.CERTIFICATE,
+)
+
+# Anzeige-Reihenfolge für die Objektliste (Keys zuerst, Daten zuletzt).
+_LIST_SEARCH_CLASSES = (
+    ObjectClass.PRIVATE_KEY,
+    ObjectClass.SECRET_KEY,
+    ObjectClass.PUBLIC_KEY,
+    ObjectClass.DATA,
+    ObjectClass.CERTIFICATE,
+)
 
 def list_objects(session: "pkcs11.Session") -> list[ObjectInfo]:
     """Alle Objekte auflisten (Keys UND Datenobjekte). Funktioniert mit
-    read-only- oder exklusiver Session. Verhalten unverändert ggü. der
-    vorherigen Inline-Logik in cli/commands/keys.py::list_cmd — nur
-    hierher verschoben, damit CLI und künftige GUI dieselbe Quelle
-    nutzen."""
+    read-only- oder exklusiver Session.
+
+    Arbeitet mit expliziten CLASS-Filtern statt einer leeren Suche:
+    Auf Pico-HSM-Firmware v6.6 via OpenSC liefert die ungefilterte
+    Suche selbst angelegte Objekte NICHT zurück (nur PROFILE-System-
+    objekt) — Hardware-Befund, siehe Moduldoc oben. Klassen sind
+    exklusiv, daher keine Duplikate möglich.
+    """
     result = []
-    for obj in session.get_objects():
-        key_type = getattr(obj, "key_type", None)
-        result.append(ObjectInfo(
-            label=getattr(obj, "label", "") or "",
-            id=getattr(obj, "id", None),
-            object_class=str(getattr(obj, "object_class", "")),
-            key_type=str(key_type) if key_type is not None else None,
-        ))
+    for object_class in _LIST_SEARCH_CLASSES:
+        for obj in session.get_objects({Attribute.CLASS: object_class}):
+            key_type = getattr(obj, "key_type", None)
+            result.append(ObjectInfo(
+                label=getattr(obj, "label", "") or "",
+                id=getattr(obj, "id", None),
+                object_class=_display_name(getattr(obj, "object_class", "")),
+                key_type=(
+                    _display_name(key_type) if key_type is not None else None
+                ),
+            ))
     return result
 
 
 def delete_object(session: "pkcs11.Session", label: str) -> bool:
-    """Objekt (Key ODER Datenobjekt) mit gegebenem Label löschen.
-    `session` muss schreibend sein. Verhalten unverändert ggü. der
-    vorherigen Inline-Logik in cli/commands/keys.py::delete_cmd. Gibt
-    False zurück, wenn kein Objekt mit diesem Label existiert (kein
-    Fehler, Aufrufer entscheidet, wie das gemeldet wird)."""
-    for obj in session.get_objects():
-        if getattr(obj, "label", None) == label:
+    """Objekt (Key ODER Datenobjekt) mit gegebenem Label unwiderruflich
+    löschen. `session` muss schreibend sein.
+
+    Sucht pro Klasse gefiltert statt per Client-Vergleich über eine
+    leere Suche — dieselbe Suche fand auf echter Hardware das
+    Datenobjekt nicht, obwohl es per Filter lesbar war (siehe Moduldoc).
+    Erster Treffer gewinnt (Reihenfolge: _DELETE_SEARCH_CLASSES);
+    False, wenn kein Objekt mit dem Label existiert (kein Fehler,
+    Aufrufer entscheidet, wie das gemeldet wird).
+
+    Hardware-Befund (Ersatzboard, `hw-logs/10-...`): Nach Löschen der
+    privaten Hälfte eines Keypairs ist auch die öffentliche Hälfte weg
+    (Paar wird vollständig geräumt oder verwaist unsichtbar,
+    per `pkcs15-tool -D` gegengeprüft) — kein zweites Delete nötig.
+    """
+    for object_class in _DELETE_SEARCH_CLASSES:
+        for obj in session.get_objects(
+            {Attribute.CLASS: object_class, Attribute.LABEL: label}
+        ):
             obj.destroy()
             return True
     return False
@@ -245,18 +307,6 @@ def read_data_object(session: "pkcs11.Session", label: str) -> bytes:
     ):
         return obj[Attribute.VALUE]
     raise ObjectsError(f"Kein Datenobjekt mit Label '{label}' gefunden.")
-
-
-def delete_data_object(session: "pkcs11.Session", label: str) -> bool:
-    """Datenobjekt anhand des Labels löschen (typgefiltert — anders als
-    `delete_object`, das auch Keys träfe, falls zufällig derselbe Label
-    doppelt vergeben wäre). `session` muss schreibend sein."""
-    for obj in session.get_objects(
-        {Attribute.CLASS: ObjectClass.DATA, Attribute.LABEL: label}
-    ):
-        obj.destroy()
-        return True
-    return False
 
 
 # --- Zufallszahlen --------------------------------------------------------

@@ -102,7 +102,9 @@ def test_read_pin_flags_maps_bitmask(monkeypatch):
     class FakeToken:
         flags = TokenFlag.LOGIN_REQUIRED | TokenFlag.USER_PIN_LOCKED
 
-    monkeypatch.setattr(pc, "get_token", lambda lib_path=None: FakeToken())
+    monkeypatch.setattr(
+        pc, "get_token", lambda lib_path=None, serial=None: FakeToken(),
+    )
     flags = pc.read_pin_flags()
     assert flags["login_required"] is True
     assert flags["user_pin_locked"] is True
@@ -113,7 +115,7 @@ def test_read_pin_flags_maps_bitmask(monkeypatch):
 
 
 def test_read_pin_flags_wraps_token_error(monkeypatch):
-    def boom(lib_path=None):
+    def boom(lib_path=None, serial=None):
         raise RuntimeError("kein Board")
 
     monkeypatch.setattr(pc, "get_token", boom)

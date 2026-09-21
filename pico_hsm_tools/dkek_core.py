@@ -12,7 +12,7 @@ interaktives Terminal (Custodian-Passworteingabe — die CLI nutzt
 absichtlich kein Pipe-Capture, siehe dkek.py). Ein GUI-Stdout-Füttern
 per stdin wäre geraten (sc-hsm-tool liest ggf. direkt /dev/tty) und
 ohne Hardware nicht verifizierbar — daher bleiben beide CLI-only
-(getroffene Entscheidung, Schritt 6d).
+(getroffene Entscheidung).
 
 SICHERHEITSVERTRAG (wie pin_core.py): Keine Exception aus diesem Modul
 enthält je einen PIN-Wert — UI-Schichten dürfen exc-Texte frei
@@ -20,10 +20,12 @@ anzeigen. PINs nur als kurzlebige Locals, nie geloggt, nie persistiert.
 Share-Inhalte werden nirgends angezeigt oder zwischengespeichert
 (hier fließt nur der Dateipfad durch).
 
-OFFENE PUNKTE (Architekturkonzept §12, ehrlich markiert): wie überall
-keine Hardware-Verifikation (kein Board vorhanden); die
-sc-hsm-tool-Aufrufe sind 1:1 aus der bisherigen, manuell verifizierten
-CLI übernommen (Syntax aus backup-and-restore.md).
+OFFENE PUNKTE (Architekturkonzept §12, ehrlich markiert): der
+DKEK-Voll-Flow (init mit --dkek-shares, import-share, wrap/unwrap)
+ist noch nicht am Board durchlaufen (docs/15 Checkliste 7 offen,
+Teilerfolg hw-logs/16); die sc-hsm-tool-Aufrufe unten sind 1:1 aus
+der manuell verifizierten CLI übernommen (Syntax aus
+backup-and-restore.md).
 """
 
 from __future__ import annotations
@@ -53,6 +55,17 @@ def _run_sc_hsm_tool(
         raise DkekError("sc-hsm-tool antwortet nicht (Timeout).") from exc
 
 
+def _failure_message(
+    result: subprocess.CompletedProcess, default: str,
+) -> str:
+    """Fehlertext aus stderr + stdout (Hardware-Befund: sc-hsm-tool legt
+    das Detail teils auf stdout — reines stderr unterschlägt es, z.B.
+    nur `Using reader ...` ohne Grund). PIN-frei per Vertrag (Tool
+    echot keine PINs)."""
+    parts = [result.stderr.strip(), result.stdout.strip()]
+    return "\n".join(part for part in parts if part) or default
+
+
 def wrap_key(out_file: str, key_reference: int, pin: str) -> None:
     """Einzelnen Private Key mit dem DKEK wrappen/exportieren (Key-Backup)."""
     result = _run_sc_hsm_tool([
@@ -60,23 +73,29 @@ def wrap_key(out_file: str, key_reference: int, pin: str) -> None:
         "--key-reference", str(key_reference), "--pin", pin,
     ])
     if result.returncode != 0:
-        raise DkekError(
-            result.stderr.strip() or "wrap-key fehlgeschlagen."
-        )
+        raise DkekError(_failure_message(result, "wrap-key fehlgeschlagen."))
 
 
-def unwrap_key(wrapped_file: str, key_reference: int, pin: str) -> None:
+def unwrap_key(
+    wrapped_file: str, key_reference: int, pin: str, force: bool = False,
+) -> None:
     """Gewrappten Key importieren (Gerät muss mit demselben DKEK
     initialisiert sein wie beim Export). Ersetzt das vorher separate
-    `keys import` — der reale Import-Mechanismus von Pico HSM."""
-    result = _run_sc_hsm_tool([
+    `keys import` — der reale Import-Mechanismus von Pico HSM.
+
+    `force=True` reicht `-f/--force` an sc-hsm-tool durch (sonst
+    verweigert das Tool den Import auf eine belegte Reference —
+    Hardware-Befund: "Found existing private key description ... use
+    --force"). Default False (kein stilles Überschreiben)."""
+    args = [
         "--unwrap-key", wrapped_file,
         "--key-reference", str(key_reference), "--pin", pin,
-    ])
+    ]
+    if force:
+        args.append("--force")
+    result = _run_sc_hsm_tool(args)
     if result.returncode != 0:
-        raise DkekError(
-            result.stderr.strip() or "unwrap-key fehlgeschlagen."
-        )
+        raise DkekError(_failure_message(result, "unwrap-key fehlgeschlagen."))
 
 
 def dkek_status() -> str:
@@ -86,11 +105,9 @@ def dkek_status() -> str:
     Bewusst UNGEPARST zurückgegeben: Das Ausgabeformat ist nur über die
     Manpage belegt, nicht über Beispiele — Parsing wäre geraten
     (Rate-Bugs). Aufrufer zeigen den Text 1:1 an (getroffene
-    Entscheidung, Schritt 6d).
+    Entscheidung).
     """
     result = _run_sc_hsm_tool([])
     if result.returncode != 0:
-        raise DkekError(
-            result.stderr.strip() or "Status-Abfrage fehlgeschlagen."
-        )
+        raise DkekError(_failure_message(result, "Status-Abfrage fehlgeschlagen."))
     return result.stdout.strip()

@@ -1,14 +1,17 @@
 [project]
-name = "pico-hsm-cli"
+name = "pico-hsm-app"
 version = "0.1.0"
-description = "Konfigurations-CLI für den Pico-HSM-Teil"
+description = "Konfigurations-App (CLI + GUI) für das Pico-HSM"
 requires-python = ">=3.10"
+# Getestete Versionsstände (2026-09, venv): click 8.5, python-pkcs11 0.10,
+# pyotp 2.10, pyscard 2.3.1, PySide6 6.11.2, PySide6-Fluent-Widgets 1.11.3,
+# pytest 9.1.1, pytest-qt 4.5. Ranges unten bleiben absichtlich flexibel.
 dependencies = [
     "click>=8.1",
     "python-pkcs11>=0.7",
     "pyotp>=2.9",
     "pyscard>=2.0",  # Vendor-APDUs (setup datetime/dynamic-options), siehe apdu_core.py
-    "PySide6>=6.8",  # GUI (Schritt 5), siehe gui/
+    "PySide6>=6.8",  # GUI, siehe gui/
     "PySide6-Fluent-Widgets>=1.6",  # Fluent-Design-Komponenten (GPLv3 beachten)
 ]
 

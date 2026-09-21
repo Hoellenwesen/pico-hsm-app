@@ -4,8 +4,8 @@ test_gui_firmware_tab.py — Firmware-Tab-Tests ohne Display und ohne Hardware.
 Core (flash_core) und Dialoge werden gemockt, Worker laufen echt.
 Deckt ab: Aufbau, Preflight-Erfolg/Fehler, Chain-Confirm, geführten
 Flash-Ablauf (TOTP ok/ungültig/abgebrochen/fehlend, BOOTSEL-Abbruch,
-rejected_totp-Audit, Progress-Log), Audit-Tabelle + Limit,
-Refresh-bei-Tab-Wechsel ohne Hardware-Zugriff.
+rejected_totp-Audit, Progress-Log), Tab-Wechsel ohne Hardware-Zugriff.
+Audit-Anzeige wohnt im Logs-Tab (tests/test_gui_logs_tab.py).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from qfluentwidgets import InfoBar
 from gui.main_window import MainWindow
 from gui.tabs import firmware_tab as fw_mod
 from pico_hsm_tools import flash_core as fc
-from pico_hsm_tools import gateway_status
+from pico_hsm_tools import audit_log
 
 
 def _preflight():
@@ -37,7 +37,7 @@ def _preflight():
 
 def _entries():
     return [
-        gateway_status.AuditEntry("2026-09-01T10:00:00", "flashed", {}),
+        audit_log.AuditEntry("2026-09-01T10:00:00", "flashed", {}),
     ]
 
 
@@ -53,7 +53,7 @@ class _FakeSecretFile:
 
 
 def _install_mocks(monkeypatch, chain_intact=True, totp_exists=False,
-                   totp_valid=True, preflight_error=None):
+                   totp_valid=True, preflight_error=None, preflight_result=None):
     """Core + Dialoge mocken. Gibt calls-Dict zurück."""
     calls: dict = {
         "preflights": [], "flashes": [], "totp_checks": [],
@@ -65,7 +65,7 @@ def _install_mocks(monkeypatch, chain_intact=True, totp_exists=False,
         if preflight_error is not None:
             raise preflight_error
         calls["preflights"].append(fw_path)
-        return _preflight()
+        return preflight_result if preflight_result is not None else _preflight()
 
     def fake_flash(preflight, on_progress=None):
         calls["flashes"].append(preflight)
@@ -86,7 +86,7 @@ def _install_mocks(monkeypatch, chain_intact=True, totp_exists=False,
         fc, "TOTP_SECRET_FILE", _FakeSecretFile(totp_exists),
     )
     monkeypatch.setattr(
-        gateway_status, "tail_flash_audit_log",
+        audit_log, "tail_flash_audit_log",
         lambda limit=20: calls["tails"].append(limit) or _entries(),
     )
     monkeypatch.setattr(
@@ -129,11 +129,8 @@ def test_builds_with_all_widgets(qtbot, monkeypatch):
         for name in (
             "fwFileEdit", "fwBrowseButton", "preflightButton",
             "preflightResultLabel", "flashButton", "flashLog",
-            "fwAuditLimitSpin", "fwAuditRefreshButton", "fwAuditChainLabel",
-            "fwAuditTable",
         ):
             assert tab.findChild(object, name) is not None, name
-        assert tab.fwAuditTable.columnCount() == 3
     finally:
         tab.close()
 
@@ -191,7 +188,6 @@ def test_flash_full_flow_without_totp(qtbot, monkeypatch):
         qtbot.waitUntil(
             lambda: "erfolgreich geflasht" in _bar_texts(tab), timeout=5000,
         )
-        assert tab.fwAuditTable.rowCount() == 1
     finally:
         tab.close()
 
@@ -245,39 +241,70 @@ def test_flash_bootsel_cancel_aborts(qtbot, monkeypatch):
         tab.close()
 
 
-# --- Audit -----------------------------------------------------------------------------
-
-def test_audit_table_limit_and_chain(qtbot, monkeypatch):
-    tab, calls = _make_tab(qtbot, monkeypatch)
+def test_preflight_skipped_gate_shows_warning(qtbot, monkeypatch):
+    skipped = fc.PreflightResult(
+        fw_path=Path("C:/tmp/fw.uf2"),
+        sha256="ab" * 32,
+        version=fc.Uf2Info(1, 0, 3),
+        board_fingerprint="",
+        last_known_rollback=2,
+        secure_boot_enabled=False,
+        fingerprint_checked=False,
+        signature_checked=False,
+    )
+    _install_mocks(monkeypatch, preflight_result=skipped)
+    tab = fw_mod.FirmwareTab()
+    qtbot.addWidget(tab)
+    tab.show()
     try:
-        tab.fwAuditLimitSpin.setValue(5)
-        tab.refresh()
-        assert tab.fwAuditTable.rowCount() == 1
-        assert "[OK] Hash-Chain intakt." in tab.fwAuditChainLabel.text()
-        assert calls["tails"] == [5]
+        tab.fwFileEdit.setText("C:/tmp/fw.uf2")
+        qtbot.mouseClick(tab.preflightButton, Qt.LeftButton)
+        qtbot.waitUntil(
+            lambda: "übersprungen" in tab.preflightResultLabel.text(),
+            timeout=5000,
+        )
+        assert "Fingerprint stimmt" not in tab.preflightResultLabel.text()
+        assert "unsignierte Firmware" in tab.preflightResultLabel.text()
     finally:
         tab.close()
 
 
-def test_audit_broken_chain_label(qtbot, monkeypatch):
-    tab, _ = _make_tab(qtbot, monkeypatch, chain_intact=False)
+def test_preflight_unknown_rollback_shows_hint(qtbot, monkeypatch):
+    unknown = fc.PreflightResult(
+        fw_path=Path("C:/tmp/fw.uf2"),
+        sha256="ab" * 32,
+        version=fc.Uf2Info(6, 6, -1),
+        board_fingerprint="",
+        last_known_rollback=-1,
+        secure_boot_enabled=False,
+        fingerprint_checked=False,
+        signature_checked=False,
+    )
+    _install_mocks(monkeypatch, preflight_result=unknown)
+    tab = fw_mod.FirmwareTab()
+    qtbot.addWidget(tab)
+    tab.show()
     try:
-        tab.refresh()
-        assert "GEBROCHEN" in tab.fwAuditChainLabel.text()
+        tab.fwFileEdit.setText("C:/tmp/fw.uf2")
+        qtbot.mouseClick(tab.preflightButton, Qt.LeftButton)
+        qtbot.waitUntil(
+            lambda: "unbekannt" in tab.preflightResultLabel.text(),
+            timeout=5000,
+        )
     finally:
         tab.close()
 
 
 # --- Tab-Wechsel -----------------------------------------------------------------------------
 
-def test_switch_to_firmware_refreshes_audit_only(qtbot, monkeypatch):
+def test_switch_to_firmware_triggers_no_hardware(qtbot, monkeypatch):
+    """Firmware-Tab hat keinen Auto-Refresh: Tab-Wechsel löst weder
+    Preflight noch Flash noch Audit-Zugriff aus (alles nur per Button)."""
     calls = _install_mocks(monkeypatch)
     window = MainWindow()
     qtbot.addWidget(window)
     window.show()
     try:
-        fw_tab = window.tab("firmware")
-        assert fw_tab.fwAuditTable.rowCount() == 0
         window.navigationInterface.widget("keys").clicked.emit(True)
         qtbot.waitUntil(
             lambda: window.stackedWidget.currentWidget() is window.tab("keys"),
@@ -285,9 +312,13 @@ def test_switch_to_firmware_refreshes_audit_only(qtbot, monkeypatch):
         )
         window.navigationInterface.widget("firmware").clicked.emit(True)
         qtbot.waitUntil(
-            lambda: fw_tab.fwAuditTable.rowCount() == 1, timeout=5000,
+            lambda: window.stackedWidget.currentWidget()
+            is window.tab("firmware"),
+            timeout=3000,
         )
+        qtbot.wait(500)
         assert calls["preflights"] == []
         assert calls["flashes"] == []
+        assert calls["tails"] == []
     finally:
         window.close()

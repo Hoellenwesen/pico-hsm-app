@@ -36,12 +36,12 @@ def _install_mocks(monkeypatch, flags=None, change_error=None,
     """Core mocken. Gibt calls-Dict zurück."""
     calls: dict = {"changes": [], "unblocks": []}
 
-    def fake_change(old_pin, new_pin, lib_path=None):
+    def fake_change(old_pin, new_pin, lib_path=None, serial=None):
         if change_error is not None:
             raise change_error
         calls["changes"].append((old_pin, new_pin))
 
-    def fake_unblock(so_pin, new_pin, lib_path=None):
+    def fake_unblock(so_pin, new_pin, lib_path=None, serial=None):
         if unblock_error is not None:
             raise unblock_error
         calls["unblocks"].append((so_pin, new_pin))
@@ -50,13 +50,18 @@ def _install_mocks(monkeypatch, flags=None, change_error=None,
     monkeypatch.setattr(pc, "unblock_user_pin", fake_unblock)
     monkeypatch.setattr(
         pc, "read_pin_flags",
-        lambda lib_path=None: dict(HEALTHY_FLAGS) if flags is None else flags,
+        lambda lib_path=None, serial=None: (
+            dict(HEALTHY_FLAGS) if flags is None else flags
+        ),
     )
     return calls
 
 
 def _make_tab(qtbot, monkeypatch, **kwargs):
     calls = _install_mocks(monkeypatch, **kwargs)
+    from gui.pin_vault import vault
+
+    vault.unlock("alt-1234")
     tab = pin_mod.PinTab()
     qtbot.addWidget(tab)
     tab.show()
@@ -76,13 +81,14 @@ def test_builds_with_all_fields(qtbot, monkeypatch):
     tab, _ = _make_tab(qtbot, monkeypatch)
     try:
         for name in (
-            "oldPinEdit", "newPinEdit1", "newPinEdit2", "changeButton",
+            "newPinEdit1", "newPinEdit2", "changeButton",
             "soPinEdit", "unblockNewPinEdit1", "unblockNewPinEdit2",
             "unblockButton", "pinStatusLabel", "pinRefreshButton",
         ):
             assert tab.findChild(object, name) is not None, name
+        assert tab.findChild(object, "oldPinEdit") is None
         fields = tab.findChildren(PasswordLineEdit)
-        assert len(fields) == 6
+        assert len(fields) == 5
     finally:
         tab.close()
 
@@ -128,7 +134,9 @@ def test_critical_flags_raise_warning(qtbot, monkeypatch):
 def test_flags_failure_shows_error(qtbot, monkeypatch):
     monkeypatch.setattr(
         pc, "read_pin_flags",
-        lambda lib_path=None: (_ for _ in ()).throw(RuntimeError("kein Board")),
+        lambda lib_path=None, serial=None: (_ for _ in ()).throw(
+            RuntimeError("kein Board"),
+        ),
     )
     monkeypatch.setattr(pc, "change_user_pin", lambda *a, **k: None)
     monkeypatch.setattr(pc, "unblock_user_pin", lambda *a, **k: None)
@@ -145,19 +153,36 @@ def test_flags_failure_shows_error(qtbot, monkeypatch):
 
 # --- Ändern ------------------------------------------------------------------------
 
-def test_change_success_clears_fields(qtbot, monkeypatch):
+def test_change_success_clears_fields_and_updates_vault(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
     tab, calls = _make_tab(qtbot, monkeypatch)
     try:
-        tab.oldPinEdit.setText("alt-1234")
         tab.newPinEdit1.setText("neu-5678")
         tab.newPinEdit2.setText("neu-5678")
         qtbot.mouseClick(tab.changeButton, Qt.LeftButton)
         qtbot.waitUntil(lambda: bool(tab.findChildren(InfoBar)), timeout=5000)
         assert calls["changes"] == [("alt-1234", "neu-5678")]
-        assert tab.oldPinEdit.text() == ""
         assert tab.newPinEdit1.text() == ""
         assert tab.newPinEdit2.text() == ""
+        assert vault.get() == "neu-5678"
         assert "erfolgreich" in _bar_texts(tab)
+    finally:
+        tab.close()
+
+
+def test_change_locked_aborts(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
+    tab, calls = _make_tab(qtbot, monkeypatch)
+    try:
+        vault.lock()
+        tab.newPinEdit1.setText("neu-5678")
+        tab.newPinEdit2.setText("neu-5678")
+        qtbot.mouseClick(tab.changeButton, Qt.LeftButton)
+        qtbot.wait(300)
+        assert calls["changes"] == []
+        assert "Gesperrt" in _bar_texts(tab)
     finally:
         tab.close()
 
@@ -165,7 +190,6 @@ def test_change_success_clears_fields(qtbot, monkeypatch):
 def test_change_mismatch_aborts_without_core_call(qtbot, monkeypatch):
     tab, calls = _make_tab(qtbot, monkeypatch)
     try:
-        tab.oldPinEdit.setText("alt-1234")
         tab.newPinEdit1.setText("neu-1111")
         tab.newPinEdit2.setText("neu-2222")
         qtbot.mouseClick(tab.changeButton, Qt.LeftButton)
@@ -179,7 +203,6 @@ def test_change_mismatch_aborts_without_core_call(qtbot, monkeypatch):
 def test_change_empty_fields_rejected(qtbot, monkeypatch):
     tab, calls = _make_tab(qtbot, monkeypatch)
     try:
-        tab.oldPinEdit.setText("alt-1234")
         qtbot.mouseClick(tab.changeButton, Qt.LeftButton)
         qtbot.wait(300)
         assert calls["changes"] == []
@@ -194,13 +217,11 @@ def test_change_failure_leaks_no_pin(qtbot, monkeypatch):
         qtbot, monkeypatch, change_error=pc.PinError("pkcs11-tool meldet Fehler."),
     )
     try:
-        tab.oldPinEdit.setText("s3cr3t-alt")
         tab.newPinEdit1.setText("s3cr3t-neu")
         tab.newPinEdit2.setText("s3cr3t-neu")
         qtbot.mouseClick(tab.changeButton, Qt.LeftButton)
         qtbot.waitUntil(lambda: bool(tab.findChildren(InfoBar)), timeout=5000)
         texts = _bar_texts(tab)
-        assert "s3cr3t-alt" not in texts
         assert "s3cr3t-neu" not in texts
         assert "fehlgeschlagen" in texts
     finally:
@@ -210,6 +231,8 @@ def test_change_failure_leaks_no_pin(qtbot, monkeypatch):
 # --- Entsperren ----------------------------------------------------------------------
 
 def test_unblock_success_clears_fields(qtbot, monkeypatch):
+    from gui.pin_vault import vault
+
     tab, calls = _make_tab(qtbot, monkeypatch)
     try:
         tab.soPinEdit.setText("so-9999")
@@ -219,6 +242,7 @@ def test_unblock_success_clears_fields(qtbot, monkeypatch):
         qtbot.waitUntil(lambda: bool(tab.findChildren(InfoBar)), timeout=5000)
         assert calls["unblocks"] == [("so-9999", "neu-0000")]
         assert tab.soPinEdit.text() == ""
+        assert vault.get() == "neu-0000"
         assert "zurückgesetzt" in _bar_texts(tab)
     finally:
         tab.close()

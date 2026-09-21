@@ -8,6 +8,7 @@ from pico_hsm_tools import flash_core as fc
 from pico_hsm_tools.flash_core import TOTP_SECRET_FILE
 
 from ..context import CliContext, pass_ctx
+from ._common import require_bootsel
 
 
 @click.group()
@@ -42,11 +43,22 @@ def preflight(ctx: CliContext, uf2_file: str) -> None:
         "version": f"{result.version.major}.{result.version.minor}",
         "rollback": result.version.rollback,
         "board_fingerprint": result.board_fingerprint,
+        "secure_boot_enabled": result.secure_boot_enabled,
+        "fingerprint_checked": result.fingerprint_checked,
+        "signature_checked": result.signature_checked,
     }
     ctx.emit_json(payload)
+    verdict = (
+        "[OK] Signatur gültig" if result.signature_checked
+        else "[OK] Prüfungen bestanden (unsignierte Firmware)"
+    )
+    fingerprint_note = (
+        "Board-Fingerprint stimmt" if result.fingerprint_checked
+        else "[WARN] Secure Boot aus — Fingerprint-Check übersprungen"
+    )
     ctx.echo(
-        f"[OK] Signatur gültig · Board-Fingerprint stimmt · "
-        f"Version {payload['version']} (rollback={payload['rollback']}) · "
+        f"{verdict} · {fingerprint_note} · "
+        f"Version {fc.format_version_rollback(result.version)} · "
         f"SHA-256: {payload['sha256']}"
     )
 
@@ -54,6 +66,7 @@ def preflight(ctx: CliContext, uf2_file: str) -> None:
 @firmware.command("flash")
 @click.argument("uf2_file", type=click.Path(exists=True))
 @pass_ctx
+@require_bootsel
 def flash(ctx: CliContext, uf2_file: str) -> None:
     """Preflight + TOTP-Autorisierung (falls konfiguriert) + Flash + Audit-Log."""
     if not fc.verify_audit_chain():
@@ -70,9 +83,12 @@ def flash(ctx: CliContext, uf2_file: str) -> None:
 
     ctx.echo(
         f"[OK] Vorab-Prüfungen bestanden: Version "
-        f"{result.version.major}.{result.version.minor} "
-        f"(rollback={result.version.rollback})"
+        f"{fc.format_version_rollback(result.version)}"
     )
+    if not result.fingerprint_checked:
+        ctx.echo("[WARN] Secure Boot aus — Fingerprint-Check übersprungen.")
+    if not result.signature_checked:
+        ctx.echo("[WARN] Unsignierte Firmware — Signatur-Check übersprungen.")
 
     if TOTP_SECRET_FILE.exists():
         secret = TOTP_SECRET_FILE.read_text().strip()
