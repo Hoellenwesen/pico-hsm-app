@@ -36,7 +36,6 @@ junit.xml
 .mypy_cache/
 .ruff_cache/
 .pyre/
-hw-logs/
 
 # --- IDE / Editor -----------------------------------------------------
 .vscode/
