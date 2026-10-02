@@ -81,7 +81,19 @@ Import (Import existiert seit Batch B).
 - HW-Nachweis: Backup erstellen → Keys löschen → Restore → Keys wieder
   nutzbar (Signatur-/Entschlüsselungsprobe).
 
-## Slice 4: Logs / Audit
+## Slice 4: Logs / Audit (implementiert 02.10.)
+
+Firmware gibt keine Geräte-Logs her (verifiziert: Rescue nur
+KEYDEV_SIGN/WRITE/SECURE/READ/REBOOT, HSM-Applet ohne Log-/Counter-Read,
+`debug.c` nur Compilezeit) — daher App-Journal, ehrlich als „App-Aktivität“
+gelabelt.
+- `auditLog.ts`: Mutationen nur (keine Reads), nie Secrets (keine PINs,
+  Shares, Blobs, Subjects, Pfade), Ring-Buffer Cap 500, localStorage +
+  JSON-Export + Clear mit Confirm.
+- Verdrahtet in allen `useDevice`-Mutationen + PIN-Forms (Erfolg + Code bei
+  Fehler); Logs-Tab mit Tabelle, Filter, Suche, Export, Clear; DummyPage
+  entfernt.
+- Vitest: Ring/Clear/korruptes Storage/Shape (Secret-Freiheit).
 
 - Umfang vorab klären: Was gibt die Firmware an Logs her?
   (Rescue-Applet? Zähler? Fehlerspeicher?) Danach Tab-Dummy ersetzen,

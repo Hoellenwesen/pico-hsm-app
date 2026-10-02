@@ -1016,10 +1016,10 @@ pub fn dkek_setup_domain(
                 "Domain setup needs a logged-in session (SW=6985)".to_string(),
             ));
         }
-        if rsp.sw_hex == "6B00" {
+        if rsp.sw_hex == "6A86" {
             return Err(DeviceError::new(
                 "DomainExists",
-                format!("Domain {domain} is already set up (SW=6B00)"),
+                format!("Domain {domain} is already set up (SW=6A86)"),
                 "Domains cannot be redefined — pick a fresh domain id.",
             ));
         }

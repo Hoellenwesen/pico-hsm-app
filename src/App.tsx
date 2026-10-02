@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { Toaster } from "sonner";
-import { ScrollText } from "lucide-react";
 import { Sidebar, type TabId } from "./components/layout/Sidebar";
 import { PinDialog } from "./components/PinDialog";
 import { Certificates } from "./pages/Certificates";
@@ -9,7 +8,7 @@ import { DeviceConfig } from "./pages/DeviceConfig";
 import { Backup } from "./pages/Backup";
 import { Firmware } from "./pages/Firmware";
 import { Keys } from "./pages/Keys";
-import { DummyPage } from "./pages/DummyPage";
+import { Logs } from "./pages/Logs";
 import { useDevice } from "./hooks/useDevice";
 
 export default function App() {
@@ -20,6 +19,12 @@ export default function App() {
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark);
   }, [dark]);
+
+  // Offline, only the dashboard is navigable — bounce back from gated tabs.
+  const online = device.online;
+  useEffect(() => {
+    if (!online) setTab("dashboard");
+  }, [online]);
 
   return (
     <div className="flex h-screen overflow-hidden bg-background text-foreground">
@@ -32,9 +37,7 @@ export default function App() {
           {tab === "backup" && <Backup device={device} />}
           {tab === "device" && <DeviceConfig device={device} />}
           {tab === "firmware" && <Firmware device={device} />}
-          {tab === "logs" && (
-            <DummyPage title="Logs" subtitle="Device logs / audit logs land here in a later step (design preview)." icon={ScrollText} />
-          )}
+          {tab === "logs" && <Logs />}
         </div>
       </main>
       <Toaster richColors position="bottom-right" closeButton />

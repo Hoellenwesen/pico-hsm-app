@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
+import { audit } from "../lib/auditLog";
 import {
   tauriApi,
   type CardStatus,
@@ -342,7 +343,14 @@ export function useDevice() {
 
   async function rebootDevice(toBootsel: boolean): Promise<string> {
     if (!live.reader) throw new Error("No device connected.");
-    return tauriApi.reboot(live.reader, toBootsel);
+    try {
+      const msg = await tauriApi.reboot(live.reader, toBootsel);
+      audit("device.reboot", toBootsel ? "BOOTSEL" : "normal", "ok");
+      return msg;
+    } catch (e) {
+      audit("device.reboot", toBootsel ? "BOOTSEL" : "normal", "error", (e as DeviceError)?.code);
+      throw e;
+    }
   }
 
   async function syncClock(dt: import("../lib/tauri").HostDatetime): Promise<string> {
@@ -363,8 +371,12 @@ export function useDevice() {
     const unlisten = await listen<FlashProgress>("flash-progress", (e) => onProgress(e.payload));
     try {
       const res = await tauriApi.flashUf2(live.reader, path);
+      audit("firmware.flash", `v${res.old_version} → v${res.new_version}`, "ok");
       setProbeNonce((n) => n + 1);
       return res;
+    } catch (e) {
+      audit("firmware.flash", "UF2 image", "error", (e as DeviceError)?.code);
+      throw e;
     } finally {
       unlisten();
     }
@@ -375,9 +387,11 @@ export function useDevice() {
     if (!live.reader) throw new Error("No device connected.");
     try {
       const msg = await tauriApi.setDynops(live.reader, pressConfirm, keyCounter, sessionPin);
+      audit("dynops.save", `press-confirm=${pressConfirm} key-counter=${keyCounter}`, "ok");
       setProbeNonce((n) => n + 1);
       return msg;
     } catch (e) {
+      audit("dynops.save", `press-confirm=${pressConfirm} key-counter=${keyCounter}`, "error", (e as DeviceError)?.code);
       if ((e as DeviceError)?.auth_required) requestPin();
       throw e;
     }
@@ -388,8 +402,10 @@ export function useDevice() {
     if (!live.reader) throw new Error("No device connected.");
     try {
       const msg = await tauriApi.setLabel(live.reader, fid, label, sessionPin);
+      audit("label.rename", fid, "ok");
       return msg;
     } catch (e) {
+      audit("label.rename", fid, "error", (e as DeviceError)?.code);
       if ((e as DeviceError)?.auth_required) requestPin();
       throw e;
     }
@@ -400,8 +416,10 @@ export function useDevice() {
     if (!live.reader) throw new Error("No device connected.");
     try {
       const res = await tauriApi.deleteKey(live.reader, id, sessionPin);
+      audit("key.delete", `ID ${id}`, "ok");
       return res;
     } catch (e) {
+      audit("key.delete", `ID ${id}`, "error", (e as DeviceError)?.code);
       if ((e as DeviceError)?.auth_required) requestPin();
       throw e;
     }
@@ -411,8 +429,11 @@ export function useDevice() {
   async function deleteCert(fid: string): Promise<string> {
     if (!live.reader) throw new Error("No device connected.");
     try {
-      return await tauriApi.deleteCert(live.reader, fid, sessionPin);
+      const msg = await tauriApi.deleteCert(live.reader, fid, sessionPin);
+      audit("cert.delete", fid, "ok");
+      return msg;
     } catch (e) {
+      audit("cert.delete", fid, "error", (e as DeviceError)?.code);
       if ((e as DeviceError)?.auth_required) requestPin();
       throw e;
     }
@@ -437,8 +458,11 @@ export function useDevice() {
   ): Promise<string> {
     if (!live.reader) throw new Error("No device connected.");
     try {
-      return await tauriApi.exportCsr(live.reader, id, spkiHex, subject, sessionPin);
+      const pem = await tauriApi.exportCsr(live.reader, id, spkiHex, subject, sessionPin);
+      audit("csr.export", `ID ${id}`, "ok");
+      return pem;
     } catch (e) {
+      audit("csr.export", `ID ${id}`, "error", (e as DeviceError)?.code);
       if ((e as DeviceError)?.auth_required) requestPin();
       throw e;
     }
@@ -449,9 +473,11 @@ export function useDevice() {
     if (!live.reader) throw new Error("No device connected.");
     try {
       const msg = await tauriApi.importCert(live.reader, id, fileBytes, sessionPin);
+      audit("cert.import", `ID ${id} (${fileBytes.length} bytes)`, "ok");
       setProbeNonce((n) => n + 1);
       return msg;
     } catch (e) {
+      audit("cert.import", `ID ${id}`, "error", (e as DeviceError)?.code);
       if ((e as DeviceError)?.auth_required) requestPin();
       throw e;
     }
@@ -485,8 +511,10 @@ export function useDevice() {
           : kind === "rsa"
             ? await tauriApi.genRsa(live.reader, param as number, label, sessionPin, counter, algos)
             : await tauriApi.genEc(live.reader, param as string, label, sessionPin, counter, algos);
+      audit("key.generate", `ID ${res.id} (${kind})`, "ok");
       return res;
     } catch (e) {
+      audit("key.generate", `(${kind})`, "error", (e as DeviceError)?.code);
       if ((e as DeviceError)?.auth_required) requestPin();
       throw e;
     }
@@ -502,9 +530,11 @@ export function useDevice() {
     if (!live.reader) throw new Error("No device connected.");
     try {
       const res = await tauriApi.dkekImportShare(live.reader, domain, shareHex, sessionPin);
+      audit("dkek.import-share", `domain ${domain} (${res.total - res.remaining}/${res.total})`, "ok");
       setProbeNonce((n) => n + 1);
       return res;
     } catch (e) {
+      audit("dkek.import-share", `domain ${domain}`, "error", (e as DeviceError)?.code);
       if ((e as DeviceError)?.auth_required) requestPin();
       throw e;
     }
@@ -515,9 +545,11 @@ export function useDevice() {
     if (!live.reader) throw new Error("No device connected.");
     try {
       const res = await tauriApi.dkekSetupDomain(live.reader, domain, shares, sessionPin);
+      audit("dkek.setup", `domain ${domain}, ${shares} shares`, "ok");
       setProbeNonce((n) => n + 1);
       return res;
     } catch (e) {
+      audit("dkek.setup", `domain ${domain}`, "error", (e as DeviceError)?.code);
       if ((e as DeviceError)?.auth_required) requestPin();
       throw e;
     }
@@ -527,8 +559,11 @@ export function useDevice() {
   async function wrapKey(id: number): Promise<string> {
     if (!live.reader) throw new Error("No device connected.");
     try {
-      return await tauriApi.wrapKey(live.reader, id, sessionPin);
+      const blob = await tauriApi.wrapKey(live.reader, id, sessionPin);
+      audit("key.wrap", `ID ${id} (${blob.length / 2} bytes)`, "ok");
+      return blob;
     } catch (e) {
+      audit("key.wrap", `ID ${id}`, "error", (e as DeviceError)?.code);
       if ((e as DeviceError)?.auth_required) requestPin();
       throw e;
     }
@@ -539,9 +574,11 @@ export function useDevice() {
     if (!live.reader) throw new Error("No device connected.");
     try {
       const msg = await tauriApi.unwrapKey(live.reader, id, blobHex, sessionPin);
+      audit("key.restore", `ID ${id}`, "ok");
       setProbeNonce((n) => n + 1);
       return msg;
     } catch (e) {
+      audit("key.restore", `ID ${id}`, "error", (e as DeviceError)?.code);
       if ((e as DeviceError)?.auth_required) requestPin();
       throw e;
     }
@@ -573,11 +610,17 @@ export function useDevice() {
     dkekRandom: boolean,
   ): Promise<string> {
     if (!live.reader) throw new Error("No device connected.");
-    const msg = await tauriApi.initDevice(live.reader, userPin, soPin, retries, dkekSlots, dkekRandom);
-    setSessionPin(userPin);
-    setPinRequired(false);
-    setProbeNonce((n) => n + 1);
-    return msg;
+    try {
+      const msg = await tauriApi.initDevice(live.reader, userPin, soPin, retries, dkekSlots, dkekRandom);
+      audit("device.init", "device initialized (keys erased)", "ok");
+      setSessionPin(userPin);
+      setPinRequired(false);
+      setProbeNonce((n) => n + 1);
+      return msg;
+    } catch (e) {
+      audit("device.init", "device initialization", "error", (e as DeviceError)?.code);
+      throw e;
+    }
   }
 
   /** "Later" on the PIN dialog: just close it. */

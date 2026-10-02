@@ -6,6 +6,7 @@ import { Button } from "./ui/Button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/Card";
 import { NA } from "./ui/NA";
 import { tauriApi, type DeviceError } from "../lib/tauri";
+import { audit } from "../lib/auditLog";
 import type { DeviceState } from "../hooks/useDevice";
 
 export function PinInput({
@@ -75,6 +76,7 @@ function ChangePinForm({
     setBusy(true);
     try {
       const msg = await tauriApi.changePin(device.live.reader, pinRef, oldPin, newPin);
+      audit(pinRef === 0x81 ? "pin.change-user" : "pin.change-so", pinRef === 0x81 ? "User-PIN" : "SO-PIN", "ok");
       toast.success(title, { description: msg });
       setOldPin("");
       setNewPin("");
@@ -86,6 +88,12 @@ function ChangePinForm({
         device.requestPin();
       }
     } catch (err) {
+      audit(
+        pinRef === 0x81 ? "pin.change-user" : "pin.change-so",
+        pinRef === 0x81 ? "User-PIN" : "SO-PIN",
+        "error",
+        (err as DeviceError)?.code,
+      );
       errToast(`${title} failed`, err);
     } finally {
       setBusy(false);
@@ -128,6 +136,7 @@ function UnblockForm({ device }: { device: DeviceState }) {
     setBusy(true);
     try {
       const msg = await tauriApi.unblockPin(device.live.reader, sopin, newPin);
+      audit("pin.unblock", "User-PIN via SO-PIN", "ok");
       toast.success("User-PIN unblocked", { description: msg });
       setSopin("");
       setNewPin("");
@@ -137,6 +146,7 @@ function UnblockForm({ device }: { device: DeviceState }) {
       device.logout();
       device.requestPin();
     } catch (err) {
+      audit("pin.unblock", "User-PIN via SO-PIN", "error", (err as DeviceError)?.code);
       errToast("Unblock failed", err);
     } finally {
       setBusy(false);

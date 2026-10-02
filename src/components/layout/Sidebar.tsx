@@ -109,13 +109,17 @@ export function Sidebar({
         {tabs.map((t) => {
           const Icon = t.icon;
           const isActive = t.id === active;
+          const gated = t.id !== "dashboard" && !device.online;
           return (
             <button
               key={t.id}
               onClick={() => onNavigate(t.id)}
+              disabled={gated}
+              title={gated ? "Connect a device first" : t.label}
               className={cn(
                 "flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors",
                 isActive ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                gated && "cursor-not-allowed opacity-40 hover:bg-transparent hover:text-muted-foreground",
               )}
             >
               <Icon size={17} />

@@ -235,25 +235,23 @@ export function Dashboard({ device, onSetup }: { device: DeviceState; onSetup: (
             ) : device.unlocked ? (
               <>
                 <Badge variant="success">Unlocked</Badge>
-                <button
-                  className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                <Button
+                  variant="ghost"
+                  className="h-7 px-2 text-xs"
                   onClick={() => {
                     device.logout();
                     toast.info("Locked", { description: "PIN cleared from memory. The device itself stays unlocked until unplugged." });
                   }}
                 >
                   Lock
-                </button>
+                </Button>
               </>
             ) : (
               <>
                 <Badge variant="outline">Locked</Badge>
-                <button
-                  className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                  onClick={() => device.requestPin()}
-                >
-                  Unlock
-                </button>
+                <Button variant="primary" className="h-7 px-3 text-xs" onClick={() => device.requestPin()}>
+                  <KeyRound size={13} /> Unlock
+                </Button>
               </>
             )}
           </InfoRow>

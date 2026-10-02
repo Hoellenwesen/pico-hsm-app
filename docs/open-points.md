@@ -72,11 +72,11 @@ camelCase-Autokonvertierung). Rest-HW-Nachweise unten.
 6. **CSP-Laufzeitcheck**: einmal DevTools-Konsole auf CSP-Verstöße prüfen
    (theoretisch keine).
 
-## E. Platzhalter (Mock-Regelverstoß behoben 01.10.)
+## E. Platzhalter (erledigt)
 
-1. ~~Mock-Buttons~~ — erledigt: `DummyPage` ist text-only (Badges +
-   Subtitle, keine Fake-Aktionen mehr). Rest-Dummy: Logs. Backup-Tab ist
-   seit Slice 3 echt (DKEK + Wrap/Unwrap).
+1. ~~Mock-Buttons, Dummy-Tabs~~ — erledigt: Backup-Tab ist seit Slice 3 echt
+   (DKEK + Wrap/Unwrap), Logs-Tab seit Slice 4 (App-Audit-Journal),
+   `DummyPage.tsx` gelöscht. Keine Platzhalter-Tabs mehr.
 2. Diese Tabs sind eigene Slices (bereits so geplant), kein Teil der
    P0-Funktionen.
 
