@@ -17,6 +17,8 @@ export interface GenRecord {
   algorithms: number[] | null;
   /** Purpose category chosen in the dialog (null = default/AES). */
   purpose: string | null;
+  /** SPKI DER hex captured at generation (RSA/EC only). Public key — safe to store. */
+  spkiHex?: string | null;
   createdAt: string;
 }
 

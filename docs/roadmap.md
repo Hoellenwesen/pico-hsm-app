@@ -34,7 +34,17 @@ Import (Import existiert seit Batch B).
 - Verlinkt: `docs/cert-followups.md` (B2-Abschnitt, CA-Import ausdrücklich
   weiter offen gelassen).
 
-## Slice 2: Initialisierung
+## Slice 2: Initialisierung (implementiert 02.10., HW-Nachweis offen)
+
+- `init_device` (`00 50 00 00` + TLV 0x81/0x82/0x91/0x92): User-PIN 6–16,
+  SO-PIN 8–16 Roh-ASCII, Retries 1–15 (Default 3), DKEK None/N-Slots (kein
+  „random“ in der UI: geräteseitig erzeugter DKEK ist nie sichtbar → keine
+  Shares → kein Restore; nur N-Slots mit externen Shares dienen Backup).
+- Init-State per `NotInitialized`-Probe (Spike ersetzt); Dashboard-Banner +
+  DeviceConfig-Sektion; Session-Übernahme nach Init; Checkbox+Danger-Confirm.
+- Stale „later slice“-Hints repariert.
+- HW-Nachweis offen: Scratch-Board (Wipe!), SO-PIN-Mindestlänge + DKEK-Tag-
+  Semantik belegen, Retry-Zähler, Re-Init-Löschung; siehe `open-points.md` (B).
 
 - Device-Init-Flow (User-PIN/SO-PIN-Setup auf frischem Gerät).
 - Init-Heuristik belegen und `useDevice`-Spike auflösen („initialized“ vs.
@@ -44,7 +54,26 @@ Import (Import existiert seit Batch B).
 - HW-Nachweis: frisches Gerät von Null auf initialisiert, Retry-Zähler,
   Blocked-/Unblock-Wege; siehe `docs/open-points.md` (B).
 
-## Slice 3: Backup & Restore (DKEK)
+## Slice 3: Backup & Restore (DKEK) (implementiert, HW-Nachweis offen)
+
+- DKEK-Status (`00 52`, total/restlich/KCV/XKEK-Flag), Share-Import (XOR
+  N-of-N, KCV-Proof, Session-PIN für Finalize), Share-Generierung (WebCrypto,
+  einmalige Anzeige, nie gespeichert). Domain-Setup (`00 52 01`, Login
+  nötig): Domain 0 kommt aus Init, 1–15 frei definierbar.
+- Wrap (`00 72`, Purpose-Gate, AES braucht Button) + Unwrap (`00 74`,
+  Extended-APDU, Domain-Suche geräteseitig, WrongDkek ehrlich) + versioniertes
+  JSON-Bundle (validiert, IDs belegt → Skip statt Overwrite) + Restore mit
+  Ergebnisliste.
+- Vitest angelegt (`npm test`): Bundle-Serde + Share-Normalisierung.
+- Domain-Bindung (Firmware-Wahrheit): Frisch generierte Keys landen IMMER in
+  Domain 0 (Vererbung nur bei ID-Wiederverwendung); eine Domain-Auswahl bei
+  Generierung existiert firmware-seitig nicht — daher keine in der UI. Echte
+  Domain-Zugehörigkeit kommt per Unwrap (Meta-Tag 0x92 = entschlüsselnde
+  Domain). Wrap nutzt automatisch die Domain des Keys; Restore matcht DKEKs
+  inhaltsbasiert (KCV), Bundle-`domain` ist rein informativ.
+- HW-Nachweis offen: 2-Board-Roundtrip (Shares → KCV gleich → Wrap →
+  Bundle → Unwrap → Signaturprobe), Negativ-Fälle (falscher Share,
+  Purpose-Verbot, belegte ID, falscher DKEK).
 
 - DKEK-Shares erzeugen/verwalten, Key-Wrap/Unwrap, Restore-Flow — jeweils
   mit Confirm-Dialogen (destruktive Schritte) und ehrlichen Fehlerpfaden.

@@ -98,6 +98,8 @@ export interface GenResult {
   detail: string;
   label_written: boolean;
   message: string;
+  /** SPKI DER hex captured from the GAK response (RSA/EC only, else null). */
+  spki_hex: string | null;
 }
 
 export interface KeyDetails {
@@ -131,6 +133,18 @@ export interface DeleteResult {
   id: number;
   deleted: string[];
   missing: string[];
+}
+
+export interface DkekStatus {
+  domain: number;
+  /** Configured share count (0 = no DKEK). */
+  total: number;
+  /** Shares still missing (0 = complete). */
+  remaining: number;
+  /** KCV as 16 uppercase hex chars. */
+  kcv_hex: string;
+  /** True when XKEK bytes trail the KCV. */
+  has_xkek: boolean;
 }
 
 export interface Uf2Info {
@@ -193,6 +207,25 @@ export const tauriApi = {
     call<string>("change_pin", { reader, pinRef, oldPin, newPin }),
   unblockPin: (reader: string, sopin: string, newPin: string) =>
     call<string>("unblock_pin", { reader, sopin, newPin }),
+  dkekStatus: (reader: string, domain: number) =>
+    call<DkekStatus>("dkek_status", { reader, domain }),
+  dkekImportShare: (reader: string, domain: number, shareHex: string, pin?: string | null) =>
+    call<DkekStatus>("dkek_import_share", { reader, domain, shareHex, pin: pin ?? null }),
+  dkekSetupDomain: (reader: string, domain: number, shares: number, pin?: string | null) =>
+    call<DkekStatus>("dkek_setup_domain", { reader, domain, shares, pin: pin ?? null }),
+  wrapKey: (reader: string, id: number, pin?: string | null) =>
+    call<string>("wrap_key", { reader, id, pin: pin ?? null }),
+  unwrapKey: (reader: string, id: number, blobHex: string, pin?: string | null) =>
+    call<string>("unwrap_key", { reader, id, blobHex, pin: pin ?? null }),
+  initDevice: (
+    reader: string,
+    userPin: string,
+    soPin: string,
+    retries: number,
+    dkekSlots: number | null,
+    dkekRandom: boolean,
+  ) =>
+    call<string>("init_device", { reader, userPin, soPin, retries, dkekSlots, dkekRandom }),
   version: (reader: string) => call<FirmwareVersion>("get_version", { reader }),
   pinRetries: (reader: string) => call<PinStatus>("get_pin_retries", { reader }),
   sopinRetries: (reader: string) => call<PinStatus>("get_sopin_retries", { reader }),
@@ -255,6 +288,23 @@ export const tauriApi = {
     }),
   deleteKey: (reader: string, id: number, pin?: string | null) =>
     call<DeleteResult>("delete_key", { reader, id, pin: pin ?? null }),
+  exportCsr: (
+    reader: string,
+    id: number,
+    spkiHex: string | null,
+    subject: { cn: string; o: string; ou: string; c: string },
+    pin?: string | null,
+  ) =>
+    call<string>("export_csr", {
+      reader,
+      id,
+      spkiHex: spkiHex ?? null,
+      cn: subject.cn,
+      o: subject.o,
+      ou: subject.ou,
+      c: subject.c,
+      pin: pin ?? null,
+    }),
   parseUf2: (path: string) => call<Uf2Info>("parse_uf2_file", { path }),
   verifyUf2: (path: string, expectedHex: string) =>
     call<string>("verify_uf2_hash", { path, expectedHex }),

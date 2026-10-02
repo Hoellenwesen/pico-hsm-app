@@ -47,8 +47,8 @@ export function PinDialog({ device }: { device: DeviceState }) {
             <KeyRound size={16} className="text-primary" /> Enter User-PIN
           </CardTitle>
           <CardDescription>
-            Required for protected operations (e.g. clock). The PIN stays in memory only and is cleared on
-            disconnect. The device stays unlocked until unplugged.
+            Required for protected operations (key management, certificates, backup). The PIN stays
+            in memory only and is cleared on disconnect. The device stays unlocked until unplugged.
           </CardDescription>
         </CardHeader>
         <CardContent>

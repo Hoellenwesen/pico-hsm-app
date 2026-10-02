@@ -137,7 +137,7 @@ export function Firmware({ device }: { device: DeviceState }) {
   }
 
   async function runFlash() {
-    if (!file) return;
+    if (!file || phase === "flashing") return;
     setConfirming(false);
     setLog([]);
     lastPhase.current = "";
@@ -399,7 +399,7 @@ export function Firmware({ device }: { device: DeviceState }) {
           <details className="mt-4 text-sm text-muted-foreground">
             <summary className="cursor-pointer hover:text-foreground">Manual fallback</summary>
             <p className="mt-1">
-              Reboot to BOOTSEL (Dashboard → Reboot), then drag the .uf2 file onto the RPI-RP2 drive in
+              Reboot to BOOTSEL (sidebar switch), then drag the .uf2 file onto the RPI-RP2 drive in
               Explorer. The board reboots itself when the copy finishes.
             </p>
           </details>
@@ -412,7 +412,7 @@ export function Firmware({ device }: { device: DeviceState }) {
           description={`Step 1: press the device button and release it when the LED asks. Step 2: writes ${formatBytes(file.bytes)} (${file.blocks} blocks, family ${file.family_hex}) via BOOTSEL. The board reboots twice. If the board stays in BOOTSEL after the copy, a quick unplug/replug finishes the reboot. Keys are preserved, but a DKEK backup is recommended before any firmware update.${verifyOn ? " SHA-256 is re-verified right before flashing." : ""}`}
           confirmLabel="Flash now"
           danger
-          busy={false}
+          busy={phase === "flashing" || hashBusy}
           onConfirm={() => void runFlash()}
           onCancel={() => setConfirming(false)}
         />

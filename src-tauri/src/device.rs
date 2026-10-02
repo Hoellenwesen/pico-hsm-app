@@ -1,4 +1,4 @@
-//! PC/SC transport + read-only Pico HSM queries (Slice 1+2).
+//! PC/SC transport + Pico HSM commands (queries, PIN, keys, certs, DKEK, init).
 //!
 //! Design: every command establishes a fresh PC/SC context and connects
 //! per call. Slightly more overhead than a held handle, but avoids all
@@ -21,7 +21,10 @@
 //! - Rescue clock: GET `80 1E 04 01` (8 bytes like DATETIME, 6985 when never
 //!   set), SET `80 1C 02 01` + 8 bytes. No PIN needed (no auth gate in the
 //!   rescue handler).
-//! - Vendor extras via `80 64 <CMD> 00`: DYNOPS=0x06, PHY=0x1B, REBOOT=0xFB.
+//! - Vendor extras via `80 64 <CMD> 00`: DYNOPS=0x06 (read/write, auth for
+//!   write), SECURE-LOCK=0x3A (ECDH ceremony). Defined but NOT handled by the
+//!   firmware dispatcher (answers 6A86): PHY=0x1B, REBOOT=0xFB, OTP=0x4C —
+//!   PHY lives in rescue (`80 1E/1C 01`), reboot in rescue (`80 1F`).
 //!   NOTE: CMD_DATETIME=0x0A was REMOVED from the HSM applet in this fork
 //!   (answers 6A86 after auth, 6982 before) — the clock now lives in the
 //!   rescue applet (see below). CMD_MEMORY=0x05 is likewise unimplemented.
@@ -529,7 +532,7 @@ fn map_pin_result(rsp: &TransmitResult, who: &str) -> Result<(), DeviceError> {
             return Err(DeviceError::new(
                 "PinBlocked",
                 format!("Wrong PIN — {who} is now blocked"),
-                "Unblock it with the SO-PIN (PIN management comes in a later slice).",
+                "Unblock it with the SO-PIN (open Device Config > PIN management).",
             ));
         }
         return Err(DeviceError::new(
@@ -542,14 +545,14 @@ fn map_pin_result(rsp: &TransmitResult, who: &str) -> Result<(), DeviceError> {
         return Err(DeviceError::new(
             "PinBlocked",
             format!("{who} is blocked"),
-            "Unblock it with the SO-PIN (PIN management comes in a later slice).",
+            "Unblock it with the SO-PIN (open Device Config > PIN management).",
         ));
     }
     if rsp.sw_hex == "6A88" {
         return Err(DeviceError::new(
             "NotInitialized",
             "Device not initialized (no PIN reference found)".to_string(),
-            "Initialize the device first (Initialization comes in a later slice).",
+            "Initialize the device first (open Device Config > Initialization).",
         ));
     }
     if rsp.sw_hex == "6986" {
@@ -653,6 +656,119 @@ pub fn unblock_pin(reader: String, sopin: String, new_pin: String) -> Result<Str
     })
 }
 
+/// DKEK setup for initialization: None (omit tag 0x92), one random DKEK
+/// (tag value 0x00), or N empty slots (tag value N, capped for sanity —
+/// exact firmware max is a hardware-verification point).
+/// NOTE: Random is protocol-complete but UI-hidden — a device-generated DKEK
+/// is never shown to anyone, so no shares exist to distribute and cross-device
+/// restore is impossible. Only N-slots (external shares) serve backup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DkekSetup {
+    None,
+    Random,
+    Slots(u8),
+}
+
+/// Build the INITIALIZE payload TLV: 0x81 user PIN, 0x82 SO-PIN (8 bytes from
+/// 16 hex chars, same encoding as change/unblock), 0x91 retry limit,
+/// 0x92 DKEK setup. Pure helper so encoding is unit-testable.
+fn build_init_tlv(user_pin: &str, so_pin: &str, retries: u8, dkek: DkekSetup) -> Result<Vec<u8>, DeviceError> {
+    if user_pin.len() < 6 || user_pin.len() > 16 || !user_pin.bytes().all(|b| (0x20..0x7F).contains(&b)) {
+        return Err(DeviceError::new(
+            "BadPin",
+            "User-PIN must be 6-16 printable ASCII characters".to_string(),
+            "Pick a new User-PIN first.",
+        ));
+    }
+    // SO-PIN travels hex-decoded (8 bytes), like the change/unblock flows
+    // (sc_hsm_encode_sopin ecosystem standard) — a raw-ASCII SO-PIN set here
+    // would be unreachable through change/unblock afterwards.
+    let sopin_bin = decode_sopin_hex(so_pin).map_err(|_| {
+        DeviceError::new(
+            "BadPin",
+            "SO-PIN must be exactly 16 hexadecimal characters".to_string(),
+            "Same format as PIN change/unblock (encodes to 8 bytes).",
+        )
+    })?;
+    if retries < 1 || retries > 15 {
+        return Err(DeviceError::new(
+            "BadRetries",
+            "Retry limit must be 1-15".to_string(),
+            "3 is the recommended default.",
+        ));
+    }
+    if let DkekSetup::Slots(n) = dkek {
+        if n < 1 || n > 8 {
+            return Err(DeviceError::new(
+                "BadDkek",
+                "DKEK slots must be 1-8 (or none/random)".to_string(),
+                "The exact firmware maximum is a hardware-verification point.",
+            ));
+        }
+    }
+    let mut tlv = vec![0x81, user_pin.len() as u8];
+    tlv.extend_from_slice(user_pin.as_bytes());
+    tlv.push(0x82);
+    tlv.push(sopin_bin.len() as u8);
+    tlv.extend_from_slice(&sopin_bin);
+    tlv.extend_from_slice(&[0x91, 0x01, retries]);
+    match dkek {
+        DkekSetup::None => {}
+        DkekSetup::Random => tlv.extend_from_slice(&[0x92, 0x01, 0x00]),
+        DkekSetup::Slots(n) => tlv.extend_from_slice(&[0x92, 0x01, n]),
+    }
+    Ok(tlv)
+}
+
+/// Initialize (or re-initialize) the device: `00 50 00 00` + init TLV.
+/// WIPES ALL KEYS (`file_initialize_flash`). Tags: 0x81 user PIN,
+/// 0x82 SO-PIN (16 hex chars, same wire encoding as change/unblock),
+/// 0x91 retry limit, 0x92 DKEK setup. No 0x80 (firmware defaults apply). No auth needed;
+/// after success the device is authenticated — the frontend should adopt
+/// the new User-PIN as session PIN without an extra VERIFY.
+#[tauri::command]
+pub fn init_device(
+    reader: String,
+    user_pin: String,
+    so_pin: String,
+    retries: u8,
+    dkek_slots: Option<u8>,
+    dkek_random: bool,
+) -> Result<String, DeviceError> {
+    let dkek = match (dkek_slots, dkek_random) {
+        (Some(n), _) => DkekSetup::Slots(n),
+        (None, true) => DkekSetup::Random,
+        (None, false) => DkekSetup::None,
+    };
+    let tlv = build_init_tlv(&user_pin, &so_pin, retries, dkek)?;
+    with_card(&reader, |card| {
+        select_hsm(card)?;
+        let apdu = case4(0x00, 0x50, 0x00, 0x00, &tlv).ok_or_else(|| {
+            DeviceError::new(
+                "InitFailed",
+                "Could not encode initialize APDU".to_string(),
+                "This is a frontend bug — please report.",
+            )
+        })?;
+        let rsp = transmit_on_card(card, &apdu)?;
+        if rsp.sw_hex == "9000" {
+            return Ok("Device initialized. All previous keys are erased.".to_string());
+        }
+        if rsp.sw_hex == "6982" {
+            return Err(DeviceError::new(
+                "InitRefused",
+                "Initialize refused (SW=6982 — secure lock may be set)".to_string(),
+                "Secure-locked devices need the MKEK mask path, which this app does not do yet.",
+            ));
+        }
+        Err(DeviceError::new(
+            "InitFailed",
+            format!("Initialize failed with SW={}", rsp.sw_hex),
+            "Nothing was changed unless the wipe already ran — check the device state.",
+        ))
+    })
+}
+
 /// Verify the User-PIN on an already-selected card.
 /// Shared by `login` and authed commands (VERIFY + op on one connection).
 /// The PIN itself never appears in any message, log, or response.
@@ -677,7 +793,7 @@ fn verify_pin(card: &pcsc::Card, pin: &str) -> Result<(), DeviceError> {
             return Err(DeviceError::new(
                 "PinBlocked",
                 "Wrong PIN — User-PIN is now blocked".to_string(),
-                "Unblock it with the SO-PIN (PIN management comes in a later slice).",
+                "Unblock it with the SO-PIN (open Device Config > PIN management).",
             ));
         }
         return Err(DeviceError::new(
@@ -690,7 +806,7 @@ fn verify_pin(card: &pcsc::Card, pin: &str) -> Result<(), DeviceError> {
         return Err(DeviceError::new(
             "PinBlocked",
             "User-PIN is blocked".to_string(),
-            "Unblock it with the SO-PIN (PIN management comes in a later slice).",
+            "Unblock it with the SO-PIN (open Device Config > PIN management).",
         ));
     }
     Err(DeviceError::new(
@@ -710,6 +826,336 @@ pub fn login(reader: String, pin: String) -> Result<String, DeviceError> {
         select_hsm(card)?;
         verify_pin(card, &pin)?;
         Ok("PIN correct.".to_string())
+    })
+}
+
+/// DKEK key-domain status: total shares, remaining imports, KCV.
+/// From `00 52` (KEY DOMAIN): response is [total, remaining, KCV×8, …XKEK?].
+/// total == 0 means no DKEK configured for the domain. KCV (first 8 bytes of
+/// SHA-256 over the DKEK) identifies the key without exposing it — compare
+/// across boards/people to prove the same DKEK.
+#[derive(Debug, Serialize, Clone)]
+pub struct DkekStatus {
+    pub domain: u8,
+    /// Configured share count (0 = no DKEK).
+    pub total: u8,
+    /// Shares still missing (0 = complete).
+    pub remaining: u8,
+    /// KCV as 16 uppercase hex chars (zeros when no DKEK material yet).
+    pub kcv_hex: String,
+    /// True when XKEK bytes trail the KCV (XKEK domain).
+    pub has_xkek: bool,
+}
+
+/// Parse a KEY DOMAIN status response (≥10 bytes).
+fn parse_dkek_status(domain: u8, data_hex: &str) -> Result<DkekStatus, DeviceError> {
+    let raw = hex::decode(data_hex).map_err(|_| {
+        DeviceError::new(
+            "DkekParse",
+            "Undecodable key-domain response".to_string(),
+            "Capture the trace for a bug report.",
+        )
+    })?;
+    if raw.len() < 10 {
+        return Err(DeviceError::new(
+            "DkekParse",
+            format!("Key-domain response too short ({} bytes)", raw.len()),
+            "Capture the trace for a bug report.",
+        ));
+    }
+    Ok(DkekStatus {
+        domain,
+        total: raw[0],
+        remaining: raw[1],
+        kcv_hex: hex::encode(&raw[2..10]).to_uppercase(),
+        has_xkek: raw.len() > 10,
+    })
+}
+
+fn map_key_domain_sw(rsp: &TransmitResult, what: &str) -> Result<(), DeviceError> {
+    if rsp.sw_hex == "9000" {
+        return Ok(());
+    }
+    if rsp.sw_hex == "6982" {
+        return Err(DeviceError::auth_required(
+            "DkekAuth",
+            format!("{what} needs User-PIN authentication (SW=6982)"),
+        ));
+    }
+    if rsp.sw_hex == "6986" {
+        return Err(DeviceError::new(
+            "DkekComplete",
+            format!("{what}: domain already complete (SW=6986)"),
+            "No more shares can be imported here.",
+        ));
+    }
+    if rsp.sw_hex == "6A88" {
+        return Err(DeviceError::new(
+            "NoDkekDomain",
+            format!("{what}: no key domain here (SW=6A88)"),
+            "Set up a DKEK domain at initialization first.",
+        ));
+    }
+    Err(DeviceError::new(
+        "DkekFailed",
+        format!("{what} failed with SW={}", rsp.sw_hex),
+        "Retry; if persistent, capture the trace for a bug report.",
+    ))
+}
+
+/// Read a DKEK key-domain status (`00 52 00 <domain>`, no data, no auth).
+#[tauri::command]
+pub fn dkek_status(reader: String, domain: u8) -> Result<DkekStatus, DeviceError> {
+    if domain >= 16 {
+        return Err(DeviceError::new(
+            "BadDomain",
+            "Key domain must be 0-15".to_string(),
+            "This is a frontend bug — please report.",
+        ));
+    }
+    with_card(&reader, |card| {
+        select_hsm(card)?;
+        let rsp = transmit_on_card(card, &[0x00, 0x52, 0x00, domain, 0x00])?;
+        if rsp.sw_hex == "6B00" || rsp.sw_hex == "6A86" {
+            return Err(DeviceError::new(
+                "NoDkekDomain",
+                format!("No DKEK domain {domain} configured (SW={})", rsp.sw_hex),
+                "Create the domain below, or initialize the device with DKEK support.",
+            ));
+        }
+        map_key_domain_sw(&rsp, "DKEK status")?;
+        parse_dkek_status(domain, &rsp.data_hex)
+    })
+}
+
+/// Import one DKEK share (`00 52 00 <domain>` + 32 bytes).
+/// XOR N-of-N: every share XORs into the slot, order irrelevant; the last
+/// share finalizes (MKEK-wrap), which is why the session PIN is verified
+/// first when provided. Response carries the new status (progress + KCV).
+#[tauri::command]
+pub fn dkek_import_share(
+    reader: String,
+    domain: u8,
+    share_hex: String,
+    pin: Option<String>,
+) -> Result<DkekStatus, DeviceError> {
+    if domain >= 16 {
+        return Err(DeviceError::new(
+            "BadDomain",
+            "Key domain must be 0-15".to_string(),
+            "This is a frontend bug — please report.",
+        ));
+    }
+    let share = hex::decode(share_hex.trim()).map_err(|_| {
+        DeviceError::new(
+            "BadShare",
+            "Share must be 64 hex characters (32 bytes)".to_string(),
+            "Paste one share exactly as generated.",
+        )
+    })?;
+    if share.len() != 32 {
+        return Err(DeviceError::new(
+            "BadShare",
+            format!("Share is {} bytes (need 32)", share.len()),
+            "Paste one share exactly as generated.",
+        ));
+    }
+    with_card(&reader, |card| {
+        select_hsm(card)?;
+        if let Some(ref p) = pin {
+            verify_pin(card, p)?;
+        }
+        let mut apdu = vec![0x00, 0x52, 0x00, domain, 0x20];
+        apdu.extend_from_slice(&share);
+        apdu.push(0x00);
+        let rsp = transmit_on_card(card, &apdu)?;
+        map_key_domain_sw(&rsp, "DKEK share import")?;
+        parse_dkek_status(domain, &rsp.data_hex)
+    })
+}
+
+/// Create a DKEK key domain (`00 52 01 <domain>` + 1 count byte, auth required).
+/// Fresh domains start empty (0 of N imported). Only possible on a never-used
+/// domain slot; existing domains answer 6B00. Returns the fresh status.
+#[tauri::command]
+pub fn dkek_setup_domain(
+    reader: String,
+    domain: u8,
+    shares: u8,
+    pin: Option<String>,
+) -> Result<DkekStatus, DeviceError> {
+    if domain >= 16 {
+        return Err(DeviceError::new(
+            "BadDomain",
+            "Key domain must be 0-15".to_string(),
+            "This is a frontend bug — please report.",
+        ));
+    }
+    if shares < 1 || shares > 8 {
+        return Err(DeviceError::new(
+            "BadDkek",
+            "Share count must be 1-8".to_string(),
+            "Pick how many shares this domain needs (all of them, XOR N-of-N).",
+        ));
+    }
+    with_card(&reader, |card| {
+        select_hsm(card)?;
+        if let Some(ref p) = pin {
+            verify_pin(card, p)?;
+        }
+        let rsp = transmit_on_card(card, &[0x00, 0x52, 0x01, domain, 0x01, shares, 0x00])?;
+        if rsp.sw_hex == "6982" {
+            return Err(DeviceError::auth_required(
+                "DkekAuth",
+                "Domain setup needs User-PIN authentication (SW=6982)".to_string(),
+            ));
+        }
+        if rsp.sw_hex == "6985" {
+            return Err(DeviceError::auth_required(
+                "DkekAuth",
+                "Domain setup needs a logged-in session (SW=6985)".to_string(),
+            ));
+        }
+        if rsp.sw_hex == "6B00" {
+            return Err(DeviceError::new(
+                "DomainExists",
+                format!("Domain {domain} is already set up (SW=6B00)"),
+                "Domains cannot be redefined — pick a fresh domain id.",
+            ));
+        }
+        map_key_domain_sw(&rsp, "DKEK domain setup")?;
+        parse_dkek_status(domain, &rsp.data_hex)
+    })
+}
+
+fn map_wrap_sw(rsp: &TransmitResult, what: &str) -> Result<(), DeviceError> {
+    if rsp.sw_hex == "9000" {
+        return Ok(());
+    }
+    if rsp.sw_hex == "6982" {
+        return Err(DeviceError::auth_required(
+            "WrapAuth",
+            format!("{what} needs User-PIN authentication (SW=6982)"),
+        ));
+    }
+    if rsp.sw_hex == "6985" {
+        return Err(DeviceError::new(
+            "WrapNotAllowed",
+            format!("{what}: key forbids it (SW=6985)"),
+            "Wrapping needs the WRAP purpose; AES wrapping additionally needs a button press. Check the key details.",
+        ));
+    }
+    if rsp.sw_hex == "6A88" {
+        return Err(DeviceError::new(
+            "NoDkekDomain",
+            format!("{what}: key has no complete DKEK domain (SW=6A88)"),
+            "Import all DKEK shares first.",
+        ));
+    }
+    if rsp.sw_hex == "6A82" {
+        return Err(DeviceError::new(
+            "KeyMissing",
+            format!("{what}: key not found (SW=6A82)"),
+            "Reload the key list.",
+        ));
+    }
+    Err(DeviceError::new(
+        "WrapFailed",
+        format!("{what} failed with SW={}", rsp.sw_hex),
+        "Retry; if persistent, capture the trace for a bug report.",
+    ))
+}
+
+/// Wrap a key with its DKEK domain (`00 72 <id> 92`, auth required).
+/// Returns the wrapped blob (hex) — self-describing, safe to store
+/// off-device. The key needs the WRAP purpose and a complete DKEK domain;
+/// AES wrapping additionally needs a button press on the device.
+#[tauri::command]
+pub fn wrap_key(reader: String, id: u8, pin: Option<String>) -> Result<String, DeviceError> {
+    if id == 0 {
+        return Err(DeviceError::new(
+            "RefusedWrap",
+            "The device key (ID 0) is not backed up".to_string(),
+            "It is recreated at initialization.",
+        ));
+    }
+    with_card(&reader, |card| {
+        select_hsm(card)?;
+        if let Some(ref p) = pin {
+            verify_pin(card, p)?;
+        }
+        let rsp = transmit_on_card(card, &[0x00, 0x72, id, 0x92, 0x00])?;
+        map_wrap_sw(&rsp, &format!("Wrap of key {id}"))?;
+        let blob = hex::decode(&rsp.data_hex).unwrap_or_default();
+        if blob.is_empty() {
+            return Err(DeviceError::new(
+                "WrapFailed",
+                format!("Wrap of key {id} returned no data"),
+                "Retry; if persistent, capture the trace for a bug report.",
+            ));
+        }
+        Ok(hex::encode(&blob).to_uppercase())
+    })
+}
+
+/// Unwrap a wrapped blob as a key id (`00 74 <id> 93` + blob, auth required).
+/// The device tries all domains for a matching DKEK; a blob encrypted for
+/// an unknown DKEK fails honestly (no partial state).
+#[tauri::command]
+pub fn unwrap_key(reader: String, id: u8, blob_hex: String, pin: Option<String>) -> Result<String, DeviceError> {
+    if id == 0 {
+        return Err(DeviceError::new(
+            "RefusedUnwrap",
+            "Cannot restore onto the device key (ID 0)".to_string(),
+            "Pick a user key id.",
+        ));
+    }
+    let blob = hex::decode(blob_hex.trim()).map_err(|_| {
+        DeviceError::new(
+            "BadBlob",
+            "Wrapped blob is not valid hex".to_string(),
+            "This backup file is corrupt — use another copy.",
+        )
+    })?;
+    if blob.is_empty() || blob.len() > 4096 {
+        return Err(DeviceError::new(
+            "BadBlob",
+            format!("Wrapped blob size {} out of range", blob.len()),
+            "This backup file is corrupt — use another copy.",
+        ));
+    }
+    with_card(&reader, |card| {
+        select_hsm(card)?;
+        if let Some(ref p) = pin {
+            verify_pin(card, p)?;
+        }
+        // Blobs (RSA-4096 is ~1 KiB wrapped) exceed short APDU: extended form via case4.
+        let apdu = case4(0x00, 0x74, id, 0x93, &blob).ok_or_else(|| {
+            DeviceError::new(
+                "BadBlob",
+                "Wrapped blob too large to send".to_string(),
+                "This backup file is corrupt — use another copy.",
+            )
+        })?;
+        let rsp = transmit_on_card(card, &apdu)?;
+        if rsp.sw_hex == "6982" {
+            return Err(DeviceError::auth_required(
+                "WrapAuth",
+                "Unwrap needs User-PIN authentication (SW=6982)".to_string(),
+            ));
+        }
+        // Wrong DKEK on every domain (6400 exec / 6984 data-invalid — the
+        // firmware never returns 6A80 here): either no local DKEK matches
+        // or the blob itself is corrupt. No partial state either way.
+        if rsp.sw_hex == "6400" || rsp.sw_hex == "6984" {
+            return Err(DeviceError::new(
+                "WrongDkek",
+                format!("No local DKEK matches this backup, or the blob is corrupt (SW={})", rsp.sw_hex),
+                "Import the DKEK shares this backup was made with first (KCV must match).",
+            ));
+        }
+        map_wrap_sw(&rsp, &format!("Unwrap as key {id}"))?;
+        Ok(format!("Key restored as ID {id}."))
     })
 }
 
@@ -907,24 +1353,6 @@ pub fn get_secure_info(reader: String) -> Result<SecureInfo, DeviceError> {
             locked: raw[1] != 0,
             boot_key: raw[2],
         })
-    })
-}
-
-/// Read dynamic options word (`80 64 06`, no auth). Bits like SELECT-FCP
-/// tag 0x85: BOOTSEL_BUTTON=0x0100, KEY_COUNTER_ALL=0x0200, SECURE_LOCK=0x0400.
-#[tauri::command]
-pub fn get_dynops(reader: String) -> Result<String, DeviceError> {
-    with_card(&reader, |card| {
-        select_hsm(card)?;
-        let rsp = transmit_on_card(card, &[0x80, 0x64, 0x06, 0x00, 0x00])?;
-        if rsp.sw_hex != "9000" {
-            return Err(DeviceError::new(
-                "DynopsFailed",
-                format!("DYNOPS read failed with SW={}", rsp.sw_hex),
-                "Retry; device may be busy (keygen can block for minutes).",
-            ));
-        }
-        Ok(rsp.data_hex)
     })
 }
 
@@ -1191,10 +1619,12 @@ pub fn get_serial(reader: String) -> Result<SerialInfo, DeviceError> {
             })? as usize
         } else if first == 0x82 {
             len_at += 2;
-            let (hi, lo) = (
-                *raw.get(len_at - 1).unwrap_or(&0) as usize,
-                *raw.get(len_at).unwrap_or(&0) as usize,
-            );
+            let hi = *raw.get(len_at - 1).ok_or_else(|| {
+                DeviceError::new("SerialParse", "CHR long length truncated".to_string(), "Capture the trace for a bug report.")
+            })? as usize;
+            let lo = *raw.get(len_at).ok_or_else(|| {
+                DeviceError::new("SerialParse", "CHR long length truncated".to_string(), "Capture the trace for a bug report.")
+            })? as usize;
             (hi << 8) | lo
         } else {
             return Err(DeviceError::new(
@@ -1226,6 +1656,9 @@ pub fn get_serial(reader: String) -> Result<SerialInfo, DeviceError> {
         })
     })
 }
+/// Minimal-length BER length encoding (short / 81 / 82, up to 65535).
+/// Longer inputs truncate silently by construction — all callers stay far
+/// below (largest: RSA-4096 CSRs ~700 bytes), so this is documented, not checked.
 fn der_len(len: usize, out: &mut Vec<u8>) {
     if len < 128 {
         out.push(len as u8);
@@ -1261,6 +1694,9 @@ fn der_integer(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Named-curve OID contents (DER, without tag/len) for SPKI parameters.
+/// NOTE: several curve tables coexist on purpose, each a different direction:
+/// name→OID here, OID→name in curve_name_by_oid, prime→name in
+/// curve_name_by_prime, name→bits in curve_bits, full domain in ec_domain.
 fn named_curve_oid(name: &str) -> Option<&'static [u8]> {
     match name {
         "secp192r1" => Some(&[0x2B, 0x81, 0x04, 0x00, 0x21]),
@@ -1341,40 +1777,7 @@ pub fn export_pubkey(reader: String, fid_hex: String, pin: Option<String>) -> Re
                 "Post the Diagnose details for analysis — nothing was changed.",
             )
         })?;
-        let spki = match pubkey {
-            CvcPubkey::Rsa { modulus, exponent } => {
-                let mut rsa_seq = der_integer(&modulus);
-                rsa_seq.extend_from_slice(&der_integer(&exponent));
-                let rsa_seq = der_tlv(0x30, &rsa_seq);
-                let mut alg = der_oid(&OID_RSA_ENCRYPTION);
-                alg.extend_from_slice(&der_tlv(0x05, &[]));
-                let alg = der_tlv(0x30, &alg);
-                let mut bit = vec![0x00];
-                bit.extend_from_slice(&rsa_seq);
-                let bit = der_tlv(0x03, &bit);
-                let mut spki = alg;
-                spki.extend_from_slice(&bit);
-                der_tlv(0x30, &spki)
-            }
-            CvcPubkey::Ec { point, curve } => {
-                let curve_oid = curve.and_then(named_curve_oid).ok_or_else(|| {
-                    DeviceError::new(
-                        "UnknownCurve",
-                        "EC curve not recognized, cannot build SPKI parameters".to_string(),
-                        "Post the Diagnose details for analysis.",
-                    )
-                })?;
-                let mut alg = der_oid(&OID_EC_PUBLIC_KEY);
-                alg.extend_from_slice(&der_oid(curve_oid));
-                let alg = der_tlv(0x30, &alg);
-                let mut bit = vec![0x00];
-                bit.extend_from_slice(&point);
-                let bit = der_tlv(0x03, &bit);
-                let mut spki = alg;
-                spki.extend_from_slice(&bit);
-                der_tlv(0x30, &spki)
-            }
-        };
+        let spki = spki_from_cvc(&pubkey)?;
         // base64 with 64-char PEM wrapping (implemented locally to avoid a new crate).
         Ok(pem_wrap(&spki, "PUBLIC KEY"))
     })
@@ -1543,6 +1946,151 @@ fn parse_cvc_pubkey(cert: &[u8]) -> Option<CvcPubkey> {
     } else {
         None
     }
+}
+
+/// Build a SubjectPublicKeyInfo DER from a parsed CVC public key.
+/// Shared by the CVC public-key export and the CSR builder.
+fn spki_from_cvc(pubkey: &CvcPubkey) -> Result<Vec<u8>, DeviceError> {
+    match pubkey {
+        CvcPubkey::Rsa { modulus, exponent } => {
+            let mut rsa_seq = der_integer(modulus);
+            rsa_seq.extend_from_slice(&der_integer(exponent));
+            let rsa_seq = der_tlv(0x30, &rsa_seq);
+            let mut alg = der_oid(&OID_RSA_ENCRYPTION);
+            alg.extend_from_slice(&der_tlv(0x05, &[]));
+            let alg = der_tlv(0x30, &alg);
+            let mut bit = vec![0x00];
+            bit.extend_from_slice(&rsa_seq);
+            let bit = der_tlv(0x03, &bit);
+            let mut spki = alg;
+            spki.extend_from_slice(&bit);
+            Ok(der_tlv(0x30, &spki))
+        }
+        CvcPubkey::Ec { point, curve } => {
+            let curve_oid = curve.and_then(named_curve_oid).ok_or_else(|| {
+                DeviceError::new(
+                    "UnknownCurve",
+                    "EC curve not recognized, cannot build SPKI parameters".to_string(),
+                    "Post the Diagnose details for analysis.",
+                )
+            })?;
+            let mut alg = der_oid(&OID_EC_PUBLIC_KEY);
+            alg.extend_from_slice(&der_oid(curve_oid));
+            let alg = der_tlv(0x30, &alg);
+            let mut bit = vec![0x00];
+            bit.extend_from_slice(point);
+            let bit = der_tlv(0x03, &bit);
+            let mut spki = alg;
+            spki.extend_from_slice(&bit);
+            Ok(der_tlv(0x30, &spki))
+        }
+    }
+}
+
+/// Parse a SubjectPublicKeyInfo DER (RSA/ECDSA only, no EdDSA/XDH).
+/// Used to validate a caller-supplied SPKI (generation-record fallback).
+/// Returns (key_type, size_bits, curve).
+fn parse_spki_pubkey(spki: &[u8]) -> Option<(String, u32, Option<String>)> {
+    let outer = parse_tlv(spki, 0)?;
+    if outer.tag != 0x30 || !outer.constructed || outer.total.end != spki.len() {
+        return None;
+    }
+    let kids = children(spki, &outer.content)?;
+    if kids.len() != 2 || kids[0].tag != 0x30 || !kids[0].constructed {
+        return None;
+    }
+    if kids[1].tag != 0x03 || kids[1].constructed {
+        return None;
+    }
+    let alg_kids = children(spki, &kids[0].content)?;
+    let oid_t = alg_kids.iter().find(|t| t.tag == 0x06)?;
+    let oid = &spki[oid_t.content.clone()];
+    let bit = &spki[kids[1].content.clone()];
+    let (&unused, key_bytes) = bit.split_first()?;
+    if unused != 0 {
+        return None;
+    }
+    if oid == OID_RSA_ENCRYPTION {
+        let rsa = parse_tlv(key_bytes, 0)?;
+        if rsa.tag != 0x30 || !rsa.constructed || rsa.total.end != key_bytes.len() {
+            return None;
+        }
+        let fields = children(key_bytes, &rsa.content)?;
+        if fields.len() != 2 || fields[0].tag != 0x02 || fields[1].tag != 0x02 {
+            return None;
+        }
+        Some(("RSA".to_string(), int_bits(&key_bytes[fields[0].content.clone()]), None))
+    } else if oid == OID_EC_PUBLIC_KEY {
+        let curve = alg_kids
+            .iter()
+            .find(|t| t.tag == 0x06 && t.content != oid_t.content)
+            .and_then(|t| curve_name_by_oid(&spki[t.content.clone()]));
+        if key_bytes.first() != Some(&0x04) {
+            return None;
+        }
+        let bits = curve.and_then(curve_bits).or_else(|| ec_point_bits(key_bytes))?;
+        Some(("EC".to_string(), bits, curve.map(|s| s.to_string())))
+    } else {
+        None
+    }
+}
+
+const OID_SHA256_RSA: [u8; 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B];
+const OID_ECDSA_SHA256_X509: [u8; 8] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
+const OID_AT_CN: [u8; 3] = [0x55, 0x04, 0x03];
+const OID_AT_O: [u8; 3] = [0x55, 0x04, 0x0A];
+const OID_AT_OU: [u8; 3] = [0x55, 0x04, 0x0B];
+const OID_AT_C: [u8; 3] = [0x55, 0x04, 0x06];
+
+/// One RelativeDistinguishedName: SET{ SEQ{ OID, string } }.
+fn rdn(oid: &[u8], tag: u8, value: &str) -> Vec<u8> {
+    let mut atv = der_oid(oid);
+    atv.extend_from_slice(&der_tlv(tag, value.as_bytes()));
+    der_tlv(0x31, &der_tlv(0x30, &atv))
+}
+
+/// Build a PKCS#10 CertificationRequestInfo DER: SEQ{ INTEGER 0, subject
+/// RDNSequence, SPKI, [0] EXPLICIT empty attributes }. Empty DN parts are
+/// skipped (CN required). The empty attributes element keeps strict parsers
+/// happy (OpenSSL emits it too).
+/// Returns Err when a value is out of range (printable, length-capped).
+fn build_tbs_csr(cn: &str, o: &str, ou: &str, c: &str, spki: &[u8]) -> Result<Vec<u8>, DeviceError> {
+    let bad = |msg: &str| {
+        DeviceError::new(
+            "BadSubject",
+            msg.to_string(),
+            "Use 1-64 chars (CN required); C is 2 letters or empty.",
+        )
+    };
+    let printable = |s: &str| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| (0x20..0x7F).contains(&b));
+    if !printable(cn) {
+        return Err(bad("Common Name must be 1-64 printable ASCII characters."));
+    }
+    for (name, v) in [("O", o), ("OU", ou)] {
+        if !v.is_empty() && !printable(v) {
+            return Err(bad(format!("{name} must be 1-64 printable ASCII characters.").as_str()));
+        }
+    }
+    if !c.is_empty() && (c.len() != 2 || !c.bytes().all(|b| b.is_ascii_alphabetic())) {
+        return Err(bad("Country must be 2 letters or empty."));
+    }
+    let mut subject = rdn(&OID_AT_CN, 0x0C, cn);
+    if !o.is_empty() {
+        subject.extend_from_slice(&rdn(&OID_AT_O, 0x0C, o));
+    }
+    if !ou.is_empty() {
+        subject.extend_from_slice(&rdn(&OID_AT_OU, 0x0C, ou));
+    }
+    if !c.is_empty() {
+        subject.extend_from_slice(&rdn(&OID_AT_C, 0x13, &c.to_uppercase()));
+    }
+    let subject = der_tlv(0x30, &subject);
+    let mut tbs = der_tlv(0x02, &[0x00]);
+    tbs.extend_from_slice(&subject);
+    tbs.extend_from_slice(spki);
+    // Empty [0] EXPLICIT attributes (a0 00), like OpenSSL emits.
+    tbs.extend_from_slice(&[0xA0, 0x00]);
+    Ok(der_tlv(0x30, &tbs))
 }
 
 /// PKCS#15 key usage from the description record's BIT STRING
@@ -2102,6 +2650,197 @@ pub fn export_cert(reader: String, fid_hex: String, pin: Option<String>) -> Resu
     })
 }
 
+/// Build a PKCS#10 certificate signing request for an on-device key.
+///
+/// Flow (mirrors the `openssl req -engine pkcs11` model): the TBS
+/// (CertificationRequestInfo) is assembled off-device; the device signs the
+/// raw TBS with `00 68 <id> <algo>` (the card hashes internally for
+/// ALGO_RSA_PKCS1_SHA256 0x33 / ALGO_EC_SHA256 0x73), and the CSR is
+/// assembled + returned as PEM. Needs User-PIN; each signature consumes one
+/// key-counter step when a limit is configured.
+///
+/// Public key sources: the stored CVC certificate (`CE<id>`, authoritative)
+/// or a caller-supplied SPKI hex (captured by this app at generation time
+/// for keys without a stored cert). RSA + ECDSA only; AES/EdDSA/XDH and
+/// unknown curves are refused honestly.
+#[tauri::command]
+pub fn export_csr(
+    reader: String,
+    id: u8,
+    spki_hex: Option<String>,
+    cn: String,
+    o: String,
+    ou: String,
+    c: String,
+    pin: Option<String>,
+) -> Result<String, DeviceError> {
+    if id == 0 {
+        return Err(DeviceError::new(
+            "RefusedCsr",
+            "No CSR for the device key (ID 0)".to_string(),
+            "Pick a user key id.",
+        ));
+    }
+    // Target key must exist (separate session, like import_cert); the details
+    // drive the key-type gate and the key-match below.
+    let details = key_details(reader.clone(), id).map_err(|_| {
+        DeviceError::new(
+            "KeyMissing",
+            format!("No key with id {id} on the device"),
+            "Generate or pick an existing key first.",
+        )
+    })?;
+    if details.key_type != "RSA" && details.key_type != "EC" {
+        return Err(DeviceError::new(
+            "RefusedCsr",
+            format!("Key {id} is {} — CSR needs RSA or EC", details.key_type),
+            "AES keys have no public key; EdDSA/XDH are not supported in this version.",
+        ));
+    }
+    with_card(&reader, |card| {
+        select_hsm(card)?;
+        if let Some(ref p) = pin {
+            verify_pin(card, p)?;
+        }
+        // SPKI: stored CVC first, caller-supplied (generation record) fallback.
+        let spki: Vec<u8>;
+        let (key_type, size_bits, curve) = match read_file_full(card, 0xCE, id)? {
+            Some(cert) if cert.first() != Some(&0x30) => match parse_cvc_pubkey(&cert) {
+                Some(pk) => {
+                    let built = spki_from_cvc(&pk)?;
+                    let summary = parse_spki_pubkey(&built).ok_or_else(|| {
+                        DeviceError::new(
+                            "CertParse",
+                            format!("Stored certificate CE{id:02X} has an unusable public key"),
+                            "Post the Diagnose details for analysis.",
+                        )
+                    })?;
+                    spki = built;
+                    summary
+                }
+                None => {
+                    return Err(DeviceError::new(
+                        "CertParse",
+                        format!("Stored certificate CE{id:02X} has an unexpected CVC layout"),
+                        "Post the Diagnose details for analysis — nothing was changed.",
+                    ))
+                }
+            },
+            _ => {
+                let hex = spki_hex.as_deref().ok_or_else(|| {
+                    DeviceError::new(
+                        "NoPubkey",
+                        format!("No on-device public key for key {id} (no stored certificate, no generation record)"),
+                        "Keys generated outside this app need a stored certificate first; or regenerate the key here.",
+                    )
+                })?;
+                let bytes = hex::decode(hex.trim()).map_err(|_| {
+                    DeviceError::new(
+                        "BadSpki",
+                        "Supplied SPKI is not valid hex".to_string(),
+                        "This is a frontend bug — please report.",
+                    )
+                })?;
+                let summary = parse_spki_pubkey(&bytes).ok_or_else(|| {
+                    DeviceError::new(
+                        "BadSpki",
+                        "Supplied SPKI is not a valid RSA/ECDSA public key".to_string(),
+                        "Regenerate the key in this app to refresh the record.",
+                    )
+                })?;
+                spki = bytes;
+                summary
+            }
+        };
+        // The key must match the device's own view (type + size/curve).
+        let matches = key_type == details.key_type
+            && details.size_bits.is_none_or(|s| s == size_bits)
+            && (details.curve.is_none() || curve.is_none() || details.curve == curve);
+        if !matches {
+            return Err(DeviceError::new(
+                "CertKeyMismatch",
+                "Public key does not match the on-device key (type/size/curve)".to_string(),
+                "Reload and retry; if persistent, capture the trace.",
+            ));
+        }
+        let tbs = build_tbs_csr(cn.trim(), o.trim(), ou.trim(), c.trim(), &spki)?;
+        // TBS carries the SPKI (RSA-4096 ≈ 550 bytes), so short APDU rarely
+        // fits: extended form via case4 (proven by secp521r1 GAK). Cap 1 KiB
+        // for the card-side APDU buffer; longer is refused honestly.
+        if tbs.len() > 1024 {
+            return Err(DeviceError::new(
+                "SubjectTooLong",
+                format!("Request info is {} bytes (cap 1024)", tbs.len()),
+                "Use shorter subject fields.",
+            ));
+        }
+        // The card hashes the raw TBS internally (SHA-256 for both algos).
+        let algo: u8 = if key_type == "RSA" { 0x33 } else { 0x73 };
+        let apdu = case4(0x00, 0x68, id, algo, &tbs).ok_or_else(|| {
+            DeviceError::new(
+                "SignFailed",
+                "Could not encode signature APDU".to_string(),
+                "This is a frontend bug — please report.",
+            )
+        })?;
+        let rsp = transmit_on_card(card, &apdu)?;
+        if rsp.sw_hex == "6982" {
+            return Err(DeviceError::auth_required(
+                "CsrAuth",
+                "CSR signing needs User-PIN authentication (SW=6982)".to_string(),
+            ));
+        }
+        if rsp.sw_hex == "6985" {
+            return Err(DeviceError::new(
+                "SignNotAllowed",
+                "Key refuses signing with this algorithm (SW=6985)".to_string(),
+                "The key's purpose restrictions or counter forbid it. Check the key details.",
+            ));
+        }
+        if rsp.sw_hex == "6A84" {
+            return Err(DeviceError::new(
+                "CounterExhausted",
+                "Key usage counter is exhausted (SW=6A84)".to_string(),
+                "This key cannot sign anymore.",
+            ));
+        }
+        if rsp.sw_hex != "9000" {
+            return Err(DeviceError::new(
+                "SignFailed",
+                format!("Device signature failed with SW={}", rsp.sw_hex),
+                "Nothing was changed. Retry; if persistent, capture the trace.",
+            ));
+        }
+        let sig = hex::decode(&rsp.data_hex).unwrap_or_default();
+        if sig.is_empty() {
+            return Err(DeviceError::new(
+                "SignFailed",
+                "Device returned an empty signature".to_string(),
+                "Retry; if persistent, capture the trace for a bug report.",
+            ));
+        }
+        // CSR: SEQ{ TBS, SEQ{ sigAlg OID (+ NULL for RSA) }, BITSTRING{00 + sig} }.
+        Ok(pem_wrap(&assemble_csr(&tbs, &key_type, &sig), "CERTIFICATE REQUEST"))
+    })
+}
+
+/// Assemble a PKCS#10 CertificationRequest DER from TBS + raw signature.
+/// Pure helper so the envelope shape is unit-testable.
+fn assemble_csr(tbs: &[u8], key_type: &str, sig: &[u8]) -> Vec<u8> {
+    let mut sig_alg = der_oid(if key_type == "RSA" { &OID_SHA256_RSA } else { &OID_ECDSA_SHA256_X509 });
+    if key_type == "RSA" {
+        sig_alg.extend_from_slice(&der_tlv(0x05, &[]));
+    }
+    let sig_alg = der_tlv(0x30, &sig_alg);
+    let mut bit = vec![0x00];
+    bit.extend_from_slice(sig);
+    let bit = der_tlv(0x03, &bit);
+    let mut csr = tbs.to_vec();
+    csr.extend_from_slice(&sig_alg);
+    csr.extend_from_slice(&bit);
+    der_tlv(0x30, &csr)
+}
+
 /// One file entry from ENUMERATE OBJECTS (`80 58`).
 #[derive(Debug, Serialize, Clone)]
 pub struct KeyEntry {
@@ -2171,6 +2910,10 @@ fn read_file_full(card: &pcsc::Card, hi: u8, lo: u8) -> Result<Option<Vec<u8>>, 
         if rsp.sw_hex == "9000" && chunk.len() < 256 {
             break;
         }
+    }
+    // An empty file carries no content — report as absent (e.g. no cert).
+    if raw.is_empty() {
+        return Ok(None);
     }
     Ok(Some(raw))
 }
@@ -2554,6 +3297,9 @@ pub struct GenResult {
     pub label_written: bool,
     /// Human-readable outcome incl. label note.
     pub message: String,
+    /// SPKI DER (hex) captured from the GAK response, when parseable.
+    /// Enables CSR for keys without a stored certificate. Public key only.
+    pub spki_hex: Option<String>,
 }
 
 /// Recursive depth-first TLV search (max depth 6).
@@ -2691,6 +3437,8 @@ pub fn key_details(reader: String, id: u8) -> Result<KeyDetails, DeviceError> {
         // EE cert decides asymmetric vs symmetric + curve.
         // type_source tracks HOW the type was derived: cvc (authoritative
         // CVC-OID parse) or heuristic (ambiguous size sets).
+        // NOTE: deliberately OID-only here (not parse_cvc_pubkey): details
+        // needs type+curve, never key material, plus heuristic fallbacks.
         let mut key_type = "unknown".to_string();
         let mut type_source = "none".to_string();
         let mut size_bits: Option<u32> = None;
@@ -2778,6 +3526,16 @@ fn first_free_id(card: &pcsc::Card) -> Result<u8, DeviceError> {
             "Delete an unused key first.",
         )
     })
+}
+
+/// Extract the SPKI (hex) from a GAK response, best-effort.
+/// The response carries the fresh public key as a 7F49 template (same shape
+/// as CVC pubkeys). None when absent/unparsable — generation still succeeds;
+/// CSR then needs a stored certificate instead.
+fn gak_spki_hex(rsp: &TransmitResult) -> Option<String> {
+    let raw = hex::decode(&rsp.data_hex).ok()?;
+    let pk = parse_cvc_pubkey(&raw)?;
+    spki_from_cvc(&pk).ok().map(|spki| hex::encode(spki).to_uppercase())
 }
 
 /// Map a key-generation response. 6982 -> auth (should not happen after VERIFY).
@@ -2895,6 +3653,7 @@ pub fn gen_aes(
             detail: format!("AES-{bits}"),
             label_written,
             message,
+            spki_hex: None,
         })
     })
 }
@@ -3055,6 +3814,7 @@ pub fn gen_rsa(
             detail: format!("RSA-{bits}"),
             label_written,
             message,
+            spki_hex: gak_spki_hex(&rsp),
         })
     })
 }
@@ -3254,6 +4014,7 @@ pub fn gen_ec(
             detail: curve,
             label_written,
             message,
+            spki_hex: gak_spki_hex(&rsp),
         })
     })
 }
@@ -3513,6 +4274,126 @@ mod tests {
         assert_eq!(curve, Some("secp256r1".to_string()));
         assert_eq!(curve_name_by_oid(named_curve_oid("brainpoolP384r1").unwrap()), Some("brainpoolP384r1"));
         assert_eq!(curve_name_by_oid(&[0x00]), None);
+    }
+
+    #[test]
+    fn csr_tbs_structure_and_validation() {
+        let spki = synth_rsa_spki(256);
+        let tbs = build_tbs_csr("pico.test", "ACME", "Lab", "de", &spki).expect("tbs builds");
+        assert!(tbs.len() <= 1024, "TBS fits the card-side cap");
+        // SEQ{ INTEGER 0, subject SEQ, SPKI SEQ, [0] empty attributes }.
+        let outer = parse_tlv(&tbs, 0).expect("tbs parses");
+        assert_eq!(outer.tag, 0x30);
+        assert_eq!(outer.total.end, tbs.len());
+        let kids = children(&tbs, &outer.content).expect("4 kids");
+        assert_eq!(kids.len(), 4);
+        assert_eq!((kids[0].tag, kids[1].tag, kids[2].tag, kids[3].tag), (0x02, 0x30, 0x30, 0xA0));
+        assert_eq!(&tbs[kids[3].total.clone()], &[0xA0, 0x00]);
+        // Subject: 4 RDNs (CN, O, OU, C); C uses PrintableString.
+        let rdns = children(&tbs, &kids[1].content).expect("rdns");
+        assert_eq!(rdns.len(), 4);
+        let last = children(&tbs, &rdns[3].content).expect("c atv");
+        assert_eq!(last.len(), 1);
+        let atv = children(&tbs, &last[0].content).expect("oid+value");
+        assert_eq!(&tbs[atv[0].content.clone()], &OID_AT_C);
+        assert_eq!(atv[1].tag, 0x13);
+        // SPKI round-trips through the SPKI parser (RSA 2048).
+        let spki_back = &tbs[kids[2].total.clone()];
+        assert_eq!(parse_spki_pubkey(spki_back), Some(("RSA".to_string(), 2048, None)));
+        // Minimal subject: CN only.
+        let mini = build_tbs_csr("x", "", "", "", &spki).expect("mini builds");
+        let kids = children(&mini, &parse_tlv(&mini, 0).unwrap().content).unwrap();
+        assert_eq!(children(&mini, &kids[1].content).unwrap().len(), 1);
+        // Rejections.
+        assert!(build_tbs_csr("", "", "", "", &spki).is_err());
+        assert!(build_tbs_csr(&"a".repeat(65), "", "", "", &spki).is_err());
+        assert!(build_tbs_csr("ok", "", "", "USA", &spki).is_err());
+        assert!(build_tbs_csr("ok", "", "", "U1", &spki).is_err());
+        assert!(build_tbs_csr("ok\nbad", "", "", "", &spki).is_err());
+        assert!(build_tbs_csr("ok", &"b".repeat(65), "", "", &spki).is_err());
+    }
+
+    #[test]
+    fn csr_spki_vectors() {
+        let rsa = synth_rsa_spki(128);
+        assert_eq!(parse_spki_pubkey(&rsa), Some(("RSA".to_string(), 1024, None)));
+        let ec = synth_ec_spki();
+        assert_eq!(
+            parse_spki_pubkey(&ec),
+            Some(("EC".to_string(), 256, Some("secp256r1".to_string())))
+        );
+        assert_eq!(parse_spki_pubkey(b"garbage"), None);
+        assert_eq!(parse_spki_pubkey(&der_tlv(0x30, &[])), None);
+    }
+
+    #[test]
+    fn csr_assembly_shape() {
+        let spki = synth_ec_spki();
+        let tbs = build_tbs_csr("ec.test", "", "", "", &spki).expect("tbs builds");
+        let fake_sig = vec![0x30, 0x44, 0x02, 0x20];
+        let csr = assemble_csr(&tbs, "EC", &fake_sig);
+        // SEQ{ TBS SEQ, sigAlg SEQ, BIT STRING }; TBS byte-identical inside.
+        let outer = parse_tlv(&csr, 0).expect("csr parses");
+        assert_eq!(outer.total.end, csr.len());
+        let kids = children(&csr, &outer.content).expect("3 kids");
+        assert_eq!((kids[0].tag, kids[1].tag, kids[2].tag), (0x30, 0x30, 0x03));
+        assert_eq!(&csr[kids[0].total.clone()], &tbs);
+        // EC sigAlg has no NULL params; RSA does.
+        let alg = children(&csr, &kids[1].content).expect("alg kids");
+        assert_eq!(alg.len(), 1);
+        assert_eq!(&csr[alg[0].content.clone()], &OID_ECDSA_SHA256_X509);
+        let rsa_csr = assemble_csr(&tbs, "RSA", &fake_sig);
+        let rkids = children(&rsa_csr, &parse_tlv(&rsa_csr, 0).unwrap().content).unwrap();
+        let ralg = children(&rsa_csr, &rkids[1].content).unwrap();
+        assert_eq!(ralg.len(), 2);
+        assert_eq!(&rsa_csr[ralg[0].content.clone()], &OID_SHA256_RSA);
+        assert_eq!(ralg[1].tag, 0x05);
+        // PEM label for CSRs.
+        let pem = pem_wrap(&csr, "CERTIFICATE REQUEST");
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE REQUEST-----\n"));
+    }
+
+    #[test]
+    fn init_tlv_vectors() {
+        // Minimal: PINs + retries, no DKEK tag. SO-PIN is 16 hex -> 8 bytes.
+        let t = build_init_tlv("123456", "3031323334353637", 3, DkekSetup::None).expect("minimal builds");
+        let mut expected = vec![0x81, 0x06];
+        expected.extend_from_slice(b"123456");
+        expected.extend_from_slice(&[0x82, 0x08, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37]);
+        expected.extend_from_slice(&[0x91, 0x01, 0x03]);
+        assert_eq!(t, expected);
+        // Random DKEK appends 92 01 00; N slots append 92 01 N.
+        let r = build_init_tlv("123456", "3031323334353637", 3, DkekSetup::Random).expect("random builds");
+        assert_eq!(&r[r.len() - 3..], &[0x92, 0x01, 0x00]);
+        let s = build_init_tlv("123456", "3031323334353637", 3, DkekSetup::Slots(2)).expect("slots builds");
+        assert_eq!(&s[s.len() - 3..], &[0x92, 0x01, 0x02]);
+        assert!(s.len() < 255, "init TLV fits short APDU");
+        // Rejections.
+        assert!(build_init_tlv("12345", "3031323334353637", 3, DkekSetup::None).is_err());
+        assert!(build_init_tlv(&"1".repeat(17), "3031323334353637", 3, DkekSetup::None).is_err());
+        assert!(build_init_tlv("123456", "1234567", 3, DkekSetup::None).is_err());
+        assert!(build_init_tlv("123456", &"1".repeat(17), 3, DkekSetup::None).is_err());
+        assert!(build_init_tlv("123456", "ZZZZZZZZZZZZZZZZ", 3, DkekSetup::None).is_err());
+        assert!(build_init_tlv("123456", "3031323334353637", 0, DkekSetup::None).is_err());
+        assert!(build_init_tlv("123456", "3031323334353637", 16, DkekSetup::None).is_err());
+        assert!(build_init_tlv("123456", "3031323334353637", 3, DkekSetup::Slots(0)).is_err());
+        assert!(build_init_tlv("123456", "3031323334353637", 3, DkekSetup::Slots(9)).is_err());
+        assert!(build_init_tlv("1234\n6", "3031323334353637", 3, DkekSetup::None).is_err());
+    }
+
+    #[test]
+    fn dkek_status_vectors() {
+        // [total, remaining, KCV×8] (+ trailing XKEK bytes).
+        let s = parse_dkek_status(0, "0302AABBCCDDEEFF0011").expect("parses");
+        assert_eq!((s.domain, s.total, s.remaining), (0, 3, 2));
+        assert_eq!(s.kcv_hex, "AABBCCDDEEFF0011");
+        assert!(!s.has_xkek);
+        let x = parse_dkek_status(1, "01000000000000000000DEADBEEF").expect("xkek parses");
+        assert!(x.has_xkek);
+        assert_eq!(x.total, 1);
+        assert_eq!(x.remaining, 0);
+        assert!(parse_dkek_status(0, "0102").is_err());
+        assert!(parse_dkek_status(0, "ZZ").is_err());
     }
 
     #[test]

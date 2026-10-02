@@ -15,6 +15,7 @@ export function Certificates({ device }: { device: DeviceState }) {
   const [busy, setBusy] = useState(false);
   const [confirmFid, setConfirmFid] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [downloading, setDownloading] = useState<string | null>(null);
   const [pendingImport, setPendingImport] = useState<{ entry: CertEntry; bytes: number[] } | null>(null);
   const [importing, setImporting] = useState(false);
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -65,7 +66,8 @@ export function Certificates({ device }: { device: DeviceState }) {
   }
 
   async function downloadPem(cert: CertEntry) {
-    if (!reader) return;
+    if (!reader || downloading) return;
+    setDownloading(cert.fid);
     try {
       const isX509 = cert.format === "x509";
       const pem = isX509 ? await device.downloadCert(cert.fid) : await device.exportCert(cert.fid);
@@ -86,6 +88,8 @@ export function Certificates({ device }: { device: DeviceState }) {
       } else {
         toast.error("Download failed", { description: err.hint ? `${err.message}. ${err.hint}` : err.message });
       }
+    } finally {
+      setDownloading(null);
     }
   }
 
@@ -222,8 +226,9 @@ export function Certificates({ device }: { device: DeviceState }) {
                                   ? `Download stored X.509 certificate ${c.fid} as PEM`
                                   : `Export public key of ${c.fid} as PEM`
                               }
+                              disabled={downloading !== null}
                               onClick={() => void downloadPem(c)}
-                              className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                              className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
                             >
                               <Download size={14} />
                             </button>

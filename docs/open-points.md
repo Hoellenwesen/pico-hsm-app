@@ -1,10 +1,16 @@
-# Offene Tests & Punkte — implementierte Funktionen (Stand: 01.10.2026)
+# Offene Tests & Punkte — implementierte Funktionen (Stand: 02.10.2026)
 
 Sortiert nach Bereich. Zertifikate stehen separat in `docs/cert-followups.md`
 (Batch B / Umfang A implementiert, Hardware-Nachweis offen).
 
 Grundsatz dabei: Alles, was bisher nur synthetisch (Unit) oder gar nicht
 verifiziert ist, braucht einmal den Hardware-Gegenbeweis am echten Board.
+
+Voll-Audit 02.10. (3 Agenten + Quellen-Verifikation gegen pico-hsm-Sources):
+SO-PIN-Hex-Inkonsistenz, Unwrap-6A80-Totpfad, Header-Fehler (0x1B/0xFB),
+Session-Clear-Lücke, Restore-Cap, Busy-Guards, Serial-0x82, CSR-Attributes,
+stale Copy, leere CE — alle behoben. False Positives entlarvt (Tauri
+camelCase-Autokonvertierung). Rest-HW-Nachweise unten.
 
 ## A. Schlüssel (Keys-Tab) — Hardware-Gegenbeweis offen
 
@@ -31,10 +37,13 @@ verifiziert ist, braucht einmal den Hardware-Gegenbeweis am echten Board.
 2. **Session-PIN**: RAM-only, Logout/Lock, Clear bei Disconnect/Reconnect.
 3. **PIN-Regeln angleichen**: `verify_pin` erlaubt 1–32, `unblock` 1–16,
    Copy spricht von 6–16 — Frontend-Validierung und Backend-Guards auf eine
-   Linie bringen und testen.
-4. **Init-Heuristik unverifiziert**: `useDevice.ts` (~Zeile 305) — Verhalten
-   an frischem/uninitialisiertem Gerät ist ein Spike; „initialized“ vs.
-   „unknown“ dort einmal belegen.
+   Linie bringen und testen. **SO-PIN übergreifend (Audit 02.10.)**: Init
+   sendete Roh-ASCII, Change/Unblock hex-dekodieren (Ecosystem-Standard) —
+   behoben (Init nutzt `decode_sopin_hex`, UI „16 hex chars“); HW-Nachweis:
+   Init + Change mit gleichem SO-PIN-Wert.
+4. **Init-State per Probe** (Spike ersetzt 02.10.): `NotInitialized` (6A88)
+   aus der PIN-Probe → `live.init`; Verhalten an frischem Gerät noch per
+   Hardware belegen. Init-UI siehe Slice 2 (Roadmap).
 5. **Options-Bits**: `resetRetryCounter` (0x0001), `secureLock` (0x0400),
    `resetOnly` (0x0020) werden gelesen, aber nirgends geschrieben/verwendet —
    entscheiden: Feature oder Anzeige streichen.
@@ -66,8 +75,8 @@ verifiziert ist, braucht einmal den Hardware-Gegenbeweis am echten Board.
 ## E. Platzhalter (Mock-Regelverstoß behoben 01.10.)
 
 1. ~~Mock-Buttons~~ — erledigt: `DummyPage` ist text-only (Badges +
-   Subtitle, keine Fake-Aktionen mehr). Rest-Dummies: Backup & Restore
-   (DKEK), Logs.
+   Subtitle, keine Fake-Aktionen mehr). Rest-Dummy: Logs. Backup-Tab ist
+   seit Slice 3 echt (DKEK + Wrap/Unwrap).
 2. Diese Tabs sind eigene Slices (bereits so geplant), kein Teil der
    P0-Funktionen.
 
@@ -75,11 +84,12 @@ verifiziert ist, braucht einmal den Hardware-Gegenbeweis am echten Board.
 
 1. ~~**`greet`-Template-Command**~~ — erledigt 01.10.: gestrichen.
    Sidebar-Pillen (Firmware-„P0“, Logs-„TBD“) ebenfalls entfernt.
-2. **Frontend-Tests**: keine vorhanden (nur `tsc` + Build). Prüfen, ob sich
-   `genRecords.ts` / Datei-Helfer für kleine Vitest-Tests lohnen.
+2. **Frontend-Tests**: `backup.test.ts` (Bundle-Serde, Share-Normalisierung)
+   existiert seit Slice 3; offen nur noch `genRecords.ts` o.ä.
 3. **`cargo audit`**: 0 Vulnerabilities, 3 informative Warnungen
    (proc-macro-error unmaintained, glib unsound/Linux-only, yoke-derive
-   yanked) — bei Gelegenheit `cargo update -p` prüfen.
+   yanked) — bei Gelegenheit `cargo update -p` prüfen. Reports werden nicht
+   im Repo abgelegt (auf Bedarf laufen lassen); letzter Stand 01.10.2026.
 4. **`npm audit`**: 0 Vulnerabilities (Stand 01.10.2026) — nach
    Dependency-Änderungen wiederholen.
 

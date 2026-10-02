@@ -27,6 +27,8 @@ export interface FieldErrors {
   platform: string | null;
 }
 
+export type InitState = "unknown" | "uninitialized" | "initialized";
+
 export interface LiveState {
   present: boolean;
   reader: string | null;
@@ -42,6 +44,8 @@ export interface LiveState {
   serial: SerialInfo | null;
   platform: PlatformInfo | null;
   fieldErrors: FieldErrors;
+  /** From the PIN probe: NotInitialized (6A88) -> uninitialized. */
+  init: InitState;
   /** Human-readable reason why no live data is available (no board connected). */
   transportNote: string | null;
 }
@@ -63,6 +67,7 @@ const EMPTY_LIVE: LiveState = {
   serial: null,
   platform: null,
   fieldErrors: EMPTY_ERRORS,
+  init: "unknown",
   transportNote: "Probing for device…",
 };
 
@@ -126,6 +131,7 @@ export function useDevice() {
             transportNote: "No smartcard readers found. Connect the Pico HSM or start pcscd.",
           }));
           setSessionPin(null);
+          setPinRequired(false);
           clockSync.current = null;
           slowDoneFor.current = null;
           return;
@@ -144,6 +150,7 @@ export function useDevice() {
             transportNote: err.hint || err.message,
           }));
           setSessionPin(null);
+          setPinRequired(false);
           clockSync.current = null;
           slowDoneFor.current = null;
           return;
@@ -205,6 +212,11 @@ export function useDevice() {
         setLive((prev) => {
           // Keep slow-tier values across fast cycles of the same connection.
           const sameConn = prev.present && prev.reader === status.reader;
+          // Init probe: PIN query answering -> initialized; 6A88
+          // (NotInitialized) -> uninitialized; other errors keep prior state.
+          const pinCode = !pinR.ok ? (pinR.e as DeviceError)?.code : undefined;
+          const init: InitState =
+            pinCode === "NotInitialized" ? "uninitialized" : pinR.ok ? "initialized" : sameConn ? prev.init : "unknown";
           return {
             present: true,
             reader: status.reader,
@@ -219,6 +231,7 @@ export function useDevice() {
             sopin: sopinR.ok ? sopinR.v : null,
             serial: serialR ? (serialR.ok ? serialR.v : null) : sameConn ? prev.serial : null,
             platform: platformR ? (platformR.ok ? platformR.v : null) : sameConn ? prev.platform : null,
+            init,
             fieldErrors: {
               rtc: rtcR.ok ? null : errText(rtcR.e),
               version: versionR ? (versionR.ok ? null : errText(versionR.e)) : sameConn ? prev.fieldErrors.version : null,
@@ -272,6 +285,10 @@ export function useDevice() {
           ...EMPTY_LIVE,
           transportNote: err.hint || err.message || "PC/SC unavailable.",
         }));
+        // Total PCSC failure: drop the session too (device may be gone;
+        // a stale PIN would fail confusingly on return).
+        setSessionPin(null);
+        setPinRequired(false);
       }
     }
 
@@ -304,10 +321,9 @@ export function useDevice() {
         };
   // Firmware retry maxima (constants, no device source): UserPIN 3, SOPIN 15.
   const pinMax = { user: 3, so: 15 };
-  // Init heuristic: device cert readable + User-PIN answering -> initialized.
-  // Fresh-device behavior unverified (spike) — otherwise honestly Unknown.
-  const initState: "initialized" | "unknown" =
-    live.present && live.serial !== null && live.pin !== null ? "initialized" : "unknown";
+  // Init state comes from the PIN probe (NotInitialized = 6A88), not from
+  // heuristics. Offline -> unknown.
+  const initState: InitState = live.present ? live.init : "unknown";
 
   // Memory from the rescue applet (FLASH INFO). Firmware size is only
   // reported on Pico targets (24-byte response) — otherwise N/A.
@@ -413,6 +429,21 @@ export function useDevice() {
     }
   }
 
+  /** Export a PKCS#10 CSR for a key id with session PIN. Signs on-device. */
+  async function exportCsr(
+    id: number,
+    spkiHex: string | null,
+    subject: { cn: string; o: string; ou: string; c: string },
+  ): Promise<string> {
+    if (!live.reader) throw new Error("No device connected.");
+    try {
+      return await tauriApi.exportCsr(live.reader, id, spkiHex, subject, sessionPin);
+    } catch (e) {
+      if ((e as DeviceError)?.auth_required) requestPin();
+      throw e;
+    }
+  }
+
   /** Import an X.509 certificate file onto a key id with session PIN. */
   async function importCert(id: number, fileBytes: number[]): Promise<string> {
     if (!live.reader) throw new Error("No device connected.");
@@ -460,6 +491,62 @@ export function useDevice() {
       throw e;
     }
   }
+  /** Read a DKEK key-domain status (no auth needed). */
+  async function dkekStatus(domain: number): Promise<import("../lib/tauri").DkekStatus> {
+    if (!live.reader) throw new Error("No device connected.");
+    return tauriApi.dkekStatus(live.reader, domain);
+  }
+
+  /** Import one DKEK share with session PIN (finalize needs login). */
+  async function dkekImportShare(domain: number, shareHex: string): Promise<import("../lib/tauri").DkekStatus> {
+    if (!live.reader) throw new Error("No device connected.");
+    try {
+      const res = await tauriApi.dkekImportShare(live.reader, domain, shareHex, sessionPin);
+      setProbeNonce((n) => n + 1);
+      return res;
+    } catch (e) {
+      if ((e as DeviceError)?.auth_required) requestPin();
+      throw e;
+    }
+  }
+
+  /** Create a DKEK domain with N shares (auth required). */
+  async function dkekSetupDomain(domain: number, shares: number): Promise<import("../lib/tauri").DkekStatus> {
+    if (!live.reader) throw new Error("No device connected.");
+    try {
+      const res = await tauriApi.dkekSetupDomain(live.reader, domain, shares, sessionPin);
+      setProbeNonce((n) => n + 1);
+      return res;
+    } catch (e) {
+      if ((e as DeviceError)?.auth_required) requestPin();
+      throw e;
+    }
+  }
+
+  /** Wrap a key with its DKEK domain (auth required). Returns blob hex. */
+  async function wrapKey(id: number): Promise<string> {
+    if (!live.reader) throw new Error("No device connected.");
+    try {
+      return await tauriApi.wrapKey(live.reader, id, sessionPin);
+    } catch (e) {
+      if ((e as DeviceError)?.auth_required) requestPin();
+      throw e;
+    }
+  }
+
+  /** Unwrap a blob as a key id (auth required). */
+  async function unwrapKey(id: number, blobHex: string): Promise<string> {
+    if (!live.reader) throw new Error("No device connected.");
+    try {
+      const msg = await tauriApi.unwrapKey(live.reader, id, blobHex, sessionPin);
+      setProbeNonce((n) => n + 1);
+      return msg;
+    } catch (e) {
+      if ((e as DeviceError)?.auth_required) requestPin();
+      throw e;
+    }
+  }
+
   /** Verify the User-PIN. Stored in RAM only, cleared on disconnect. Never logged. */
   async function login(pin: string): Promise<string> {
     if (!live.reader) throw new Error("No device connected.");
@@ -473,6 +560,24 @@ export function useDevice() {
   function logout() {
     setSessionPin(null);
     setPinRequired(false);
+  }
+
+  /** Initialize (or wipe + re-initialize) the device. Destructive.
+   * The device is authenticated afterwards, so the new User-PIN becomes
+   * the session PIN directly — no extra VERIFY roundtrip. */
+  async function initializeDevice(
+    userPin: string,
+    soPin: string,
+    retries: number,
+    dkekSlots: number | null,
+    dkekRandom: boolean,
+  ): Promise<string> {
+    if (!live.reader) throw new Error("No device connected.");
+    const msg = await tauriApi.initDevice(live.reader, userPin, soPin, retries, dkekSlots, dkekRandom);
+    setSessionPin(userPin);
+    setPinRequired(false);
+    setProbeNonce((n) => n + 1);
+    return msg;
   }
 
   /** "Later" on the PIN dialog: just close it. */
@@ -516,11 +621,18 @@ export function useDevice() {
     deleteKey,
     deleteCert,
     exportCert,
+    exportCsr,
     importCert,
     downloadCert,
     generateKey,
     login,
     logout,
+    initializeDevice,
+    dkekStatus,
+    dkekImportShare,
+    dkekSetupDomain,
+    wrapKey,
+    unwrapKey,
     unlocked: sessionPin !== null,
     pinRequired,
     requestPin,

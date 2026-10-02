@@ -8,7 +8,7 @@ import { NA } from "./ui/NA";
 import { tauriApi, type DeviceError } from "../lib/tauri";
 import type { DeviceState } from "../hooks/useDevice";
 
-function PinInput({
+export function PinInput({
   value,
   onChange,
   placeholder,
@@ -183,12 +183,20 @@ export function PinManagement({ device }: { device: DeviceState }) {
       <CardContent className="space-y-4">
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <span className="text-muted-foreground">Tries left:</span>
-          <Badge variant="outline">
-            UserPIN {userTries && userTries.retries >= 0 ? userTries.retries : "N/A"}
-          </Badge>
-          <Badge variant="outline">
-            SOPIN {soTries && soTries.retries >= 0 ? soTries.retries : "N/A"}
-          </Badge>
+          {userTries && userTries.retries >= 0 ? (
+            <Badge variant="outline">UserPIN {userTries.retries}</Badge>
+          ) : (
+            <span>
+              UserPIN <NA />
+            </span>
+          )}
+          {soTries && soTries.retries >= 0 ? (
+            <Badge variant="outline">SOPIN {soTries.retries}</Badge>
+          ) : (
+            <span>
+              SOPIN <NA />
+            </span>
+          )}
           {device.live.pin?.blocked && <Badge variant="destructive">User-PIN blocked</Badge>}
         </div>
         <div className="grid gap-4 lg:grid-cols-3">

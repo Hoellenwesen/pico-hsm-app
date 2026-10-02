@@ -50,6 +50,7 @@ export function Sidebar({
 }) {
   // Two-step confirm: first toggle arms, second toggle within 6 s reboots.
   const [armed, setArmed] = useState(false);
+  const [rebooting, setRebooting] = useState(false);
   useEffect(() => {
     if (!armed) return;
     const t = setTimeout(() => setArmed(false), 6000);
@@ -57,6 +58,7 @@ export function Sidebar({
   }, [armed]);
 
   async function handleBootsel(v: boolean) {
+    if (rebooting) return;
     if (!v) {
       setArmed(false);
       device.setBootsel(false);
@@ -74,6 +76,7 @@ export function Sidebar({
       return;
     }
     setArmed(false);
+    setRebooting(true);
     try {
       const msg = await device.rebootDevice(true);
       device.setBootsel(true);
@@ -83,6 +86,8 @@ export function Sidebar({
       toast.error(err.code === "RebootUnsupported" ? "Reboot not supported here" : "Reboot failed", {
         description: err.hint || err.message || String(e),
       });
+    } finally {
+      setRebooting(false);
     }
   }
 

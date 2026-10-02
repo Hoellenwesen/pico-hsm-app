@@ -17,6 +17,7 @@ function pinText(pin: PinStatus | null): string {
 /** Raw device values + field errors for troubleshooting. Collapsed by default. */
 export function Diagnose({ device }: { device: DeviceState }) {
   const [open, setOpen] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [apdu, setApdu] = useState("00B1C402045402000000");
   const [applet, setApplet] = useState("hsm");
   const [sending, setSending] = useState(false);
@@ -89,9 +90,12 @@ export function Diagnose({ device }: { device: DeviceState }) {
             )}
             {device.online && (
               <button
-                className="ml-2 rounded border border-border px-2 py-0.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+                className="ml-2 rounded border border-border px-2 py-0.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
                 title="Set the device clock to this computer's local time"
+                disabled={syncing}
                 onClick={async () => {
+                  if (syncing) return;
+                  setSyncing(true);
                   try {
                     const now = new Date();
                     const msg = await device.syncClock({
@@ -107,10 +111,12 @@ export function Diagnose({ device }: { device: DeviceState }) {
                   } catch (e) {
                     const err = e as { hint?: string; message?: string };
                     toast.error("Clock sync failed", { description: err.hint || err.message || String(e) });
+                  } finally {
+                    setSyncing(false);
                   }
                 }}
               >
-                Sync with host time
+                {syncing ? "Syncing…" : "Sync with host time"}
               </button>
             )}
           </span>

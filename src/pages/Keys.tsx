@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Info, KeyRound, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { FileSignature, Info, KeyRound, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
@@ -191,6 +191,7 @@ function GenerateDialog({
           counter: useCounter,
           algorithms,
           purpose: kind === "aes" || purpose === "default" ? null : purpose,
+          spkiHex: res.spki_hex ?? null,
         });
       }
       toast.success("Key generated", { description: res.message });
@@ -371,7 +372,7 @@ function GenerateDialog({
           )}
           <p className="text-xs text-muted-foreground">
             If an error occurs, check the key list before retrying — the key may exist despite the error
-            (blind retries create duplicates, removable in Phase 3 Delete).
+            (blind retries create duplicates, removable via Delete).
           </p>
         </CardContent>
     </ModalShell>
@@ -620,6 +621,104 @@ function DetailsDialog({
   );
 }
 
+function CsrDialog({
+  id,
+  serial,
+  device,
+  onClose,
+}: {
+  id: number;
+  serial: string | null;
+  device: DeviceState;
+  onClose: () => void;
+}) {
+  const [cn, setCn] = useState("");
+  const [o, setO] = useState("");
+  const [ou, setOu] = useState("");
+  const [c, setC] = useState("");
+  const [busy, setBusy] = useState(false);
+  const printable = (s: string) => s.length <= 64 && !/[\x00-\x1F\x7F]/.test(s);
+  const cnOk = cn.trim().length >= 1 && cn.trim().length <= 64 && printable(cn.trim());
+  const oOk = o.trim() === "" || (printable(o.trim()) && o.trim().length >= 1);
+  const ouOk = ou.trim() === "" || (printable(ou.trim()) && ou.trim().length >= 1);
+  const cOk = c.trim() === "" || /^[A-Za-z]{2}$/.test(c.trim());
+  const canSubmit = device.online && !busy && cnOk && oOk && ouOk && cOk;
+
+  async function submit() {
+    if (!canSubmit) return;
+    setBusy(true);
+    try {
+      const spkiHex = loadGenRecord(serial, id)?.spkiHex ?? null;
+      const pem = await device.exportCsr(id, spkiHex, {
+        cn: cn.trim(),
+        o: o.trim(),
+        ou: ou.trim(),
+        c: c.trim(),
+      });
+      const blob = new Blob([pem], { type: "application/x-pem-file" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `key-${id}.csr.pem`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success("CSR exported", { description: `Signed on-device by key ID ${id}.` });
+      onClose();
+    } catch (e) {
+      const err = e as DeviceError;
+      if (err?.auth_required) {
+        toast.info("Login required", { description: "Enter the User-PIN, then export again." });
+      } else {
+        toast.error("CSR failed", { description: err.hint ? `${err.message}. ${err.hint}` : err.message });
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const inputCls =
+    "h-8 w-full rounded-md border border-border bg-background px-2 text-sm outline-none focus:border-primary";
+  return (
+    <ModalShell onCancel={onClose} busy={busy}>
+      <CardHeader>
+        <CardTitle>
+          <FileSignature size={16} className="text-primary" /> CSR for key ID {id}
+        </CardTitle>
+        <CardDescription>
+          PKCS#10, signed on-device (SHA-256). Needs a stored certificate or a generation record
+          from this computer for the public key. Uses one key-counter step when limited.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3 text-sm">
+        <label className="block">
+          <span className="mb-1 block text-xs text-muted-foreground">Common Name (required)</span>
+          <input value={cn} maxLength={64} onChange={(e) => setCn(e.target.value)} className={inputCls} placeholder="pico.example" />
+          {!cnOk && cn !== "" && <span className="text-xs text-red-500">1–64 printable characters.</span>}
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-xs text-muted-foreground">Organization (optional)</span>
+          <input value={o} maxLength={64} onChange={(e) => setO(e.target.value)} className={inputCls} />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-xs text-muted-foreground">Organizational Unit (optional)</span>
+          <input value={ou} maxLength={64} onChange={(e) => setOu(e.target.value)} className={inputCls} />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-xs text-muted-foreground">Country, 2 letters (optional)</span>
+          <input value={c} maxLength={2} onChange={(e) => setC(e.target.value)} className={inputCls} placeholder="DE" />
+          {!cOk && <span className="text-xs text-red-500">Exactly 2 letters or empty.</span>}
+        </label>
+        <div className="flex gap-2 pt-1">
+          <Button variant="primary" disabled={!canSubmit} onClick={() => void submit()}>
+            {busy ? "Signing…" : "Export CSR"}
+          </Button>
+          <ModalCancel onCancel={onClose} busy={busy} />
+        </div>
+      </CardContent>
+    </ModalShell>
+  );
+}
+
 export function Keys({ device }: { device: DeviceState }) {
   const [entries, setEntries] = useState<KeyEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -659,6 +758,7 @@ export function Keys({ device }: { device: DeviceState }) {
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteDone, setDeleteDone] = useState<{ id: number; label: string | null; ok: boolean; text: string }[]>([]);
   const [detailsId, setDetailsId] = useState<number | null>(null);
+  const [csrId, setCsrId] = useState<number | null>(null);
 
   // Drop selection of groups that vanished (e.g. after delete + reload).
   useEffect(() => {
@@ -746,8 +846,7 @@ export function Keys({ device }: { device: DeviceState }) {
         <div>
           <h1 className="text-xl font-bold tracking-tight">Keys</h1>
           <p className="text-sm text-muted-foreground">
-            On-device objects (ENUMERATE OBJECTS), grouped by key ID. Generate and delete land here in the next
-            phases.
+            On-device objects (ENUMERATE OBJECTS), grouped by key ID.
           </p>
         </div>
         <div className="flex gap-2">
@@ -813,7 +912,7 @@ export function Keys({ device }: { device: DeviceState }) {
             <p className="text-sm text-muted-foreground">{busy ? "Reading…" : "—"}</p>
           ) : groups.length === 0 && singles.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              No keys stored. Key generation lands here in Phase 2.
+              No keys stored. Use Generate to create one.
             </p>
           ) : (
             <div className="overflow-x-auto">
@@ -919,6 +1018,15 @@ export function Keys({ device }: { device: DeviceState }) {
                               <Trash2 size={14} />
                             </button>
                           )}
+                          {!g.isDevice && (
+                            <button
+                              title={`Export certificate signing request (CSR) for key ID ${g.id}`}
+                              onClick={() => setCsrId(g.id)}
+                              className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                            >
+                              <FileSignature size={14} />
+                            </button>
+                          )}
                         </span>
                       </td>
                     </tr>
@@ -947,6 +1055,9 @@ export function Keys({ device }: { device: DeviceState }) {
           if (!g || !device.live.reader) return null;
           return <DetailsDialog group={g} reader={device.live.reader} serial={device.device.serial} onClose={() => setDetailsId(null)} />;
         })()}
+      {csrId !== null && (
+        <CsrDialog id={csrId} serial={device.device.serial} device={device} onClose={() => setCsrId(null)} />
+      )}
     </div>
   );
 }

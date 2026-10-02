@@ -52,7 +52,7 @@ function OptBadge({ on }: { on: boolean | undefined }) {
   return <Badge variant={on ? "success" : "outline"}>{on ? "ON" : "OFF"}</Badge>;
 }
 
-export function Dashboard({ device }: { device: DeviceState }) {
+export function Dashboard({ device, onSetup }: { device: DeviceState; onSetup: () => void }) {
   const d = device.device;
   const m = device.memory;
   const usedPct = m ? Math.round((m.usedBytes / m.totalBytes) * 100) : 0;
@@ -87,6 +87,25 @@ export function Dashboard({ device }: { device: DeviceState }) {
                 {device.transportNote ?? "Plug in your Pico HSM to see live values."}
               </p>
             </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {device.online && device.initState === "uninitialized" && (
+        <Card className="border-amber-500/30 bg-amber-500/5">
+          <CardContent className="flex flex-wrap items-center gap-4 p-5">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-amber-500/15 text-amber-500">
+              <KeyRound size={20} />
+            </span>
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-semibold">Device not initialized</p>
+              <p className="text-sm text-muted-foreground">
+                No PIN set yet — set User-PIN and SO-PIN first. Initialization erases all keys.
+              </p>
+            </div>
+            <Button variant="primary" onClick={onSetup}>
+              Set up now
+            </Button>
           </CardContent>
         </Card>
       )}
@@ -145,7 +164,7 @@ export function Dashboard({ device }: { device: DeviceState }) {
                   <span className="max-w-[260px] truncate" title={device.live.reader}>
                     {device.live.reader}
                   </span>
-                  <Badge variant="outline">{device.live.protocol ?? "?"}</Badge>
+                  {device.live.protocol ? <Badge variant="outline">{device.live.protocol}</Badge> : <NA />}
                 </>
               ) : (
                 <NA />
