@@ -1,0 +1,45 @@
+[package]
+name = "pico-hsm-app"
+version = "0.1.0"
+description = "Pico HSM App - Cross-platform manager for Pico HSM hardware"
+authors = ["Sebastian Weyer"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "pico_hsm_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pcsc = "2"
+hex = "0.4"
+tauri-plugin-dialog = "2.8.1"
+sha2 = "0.11.0"
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+# pcsc panics on unknown WinSCard codes (e.g. raw 0x1F/ERROR_GEN_FAILURE when
+# the reader vanishes during reboot/unplug) whenever debug_assertions are on.
+# Tauri invokes commands on the main thread inside a non-unwinding WebView2
+# COM callback, so that panic aborts the whole process (0xC0000409) instead of
+# unwinding. Release builds already take pcsc's masking path (UnknownError);
+# force the same for dev builds so unplug/reboot surface as clean errors.
+[profile.dev.package.pcsc]
+debug-assertions = false

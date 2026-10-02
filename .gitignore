@@ -1,1 +1,47 @@
 .vscode
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+src-tauri/target/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS noise
+Thumbs.db
+
+# Key material and device artifacts. These must never enter the repository: a wrap blob, a DKEK
+# share, a private key or a board dump is the user's credential, not a build product.
+*.wrap
+*.pbe
+*.dkek
+*.pem
+*.key
+*.der
+*.crt
+*.p12
+*.pfx
+hw-test.bin
+roundtrip.bin
+__pycache__/
+*.pyc
