@@ -5,6 +5,12 @@
  * SECRET RULE: entries carry action + ids/labels/counts/versions/result
  * only. Never PINs, shares, blobs, subjects, or file paths (paths may
  * contain user names — sizes only). The unit tests enforce patterns.
+ *
+ * Documented exceptions (still secret-free):
+ * - "csr.export" logs the key id only, although signing consumes a
+ *   key-counter step — the counter delta is not observable, only the fact.
+ * - "diagnose.raw-apdu" logs applet + INS byte + payload length, never the
+ *   payload itself (a VERIFY PIN would fit in there).
  */
 
 export type AuditResult = "ok" | "error";

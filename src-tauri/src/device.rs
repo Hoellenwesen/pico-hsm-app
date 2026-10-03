@@ -2797,6 +2797,13 @@ pub fn export_csr(
                 "The key's purpose restrictions or counter forbid it. Check the key details.",
             ));
         }
+        if rsp.sw_hex == "6A82" {
+            return Err(DeviceError::new(
+                "KeyMissing",
+                format!("Key {id} vanished before signing (SW=6A82)"),
+                "Reload the key list.",
+            ));
+        }
         if rsp.sw_hex == "6A84" {
             return Err(DeviceError::new(
                 "CounterExhausted",

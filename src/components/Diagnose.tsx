@@ -3,7 +3,8 @@ import { ChevronDown, Copy, Send, Wrench } from "lucide-react";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/Card";
 import { NA } from "./ui/NA";
-import { tauriApi, type TransmitResult } from "../lib/tauri";
+import { tauriApi, type DeviceError, type TransmitResult } from "../lib/tauri";
+import { audit } from "../lib/auditLog";
 import type { DeviceState } from "../hooks/useDevice";
 import type { PinStatus } from "../lib/tauri";
 
@@ -26,10 +27,17 @@ export function Diagnose({ device }: { device: DeviceState }) {
   async function send() {
     if (!device.live.reader || sending || apdu.trim() === "") return;
     setSending(true);
+    // Journal the raw APDU shape only (applet + INS + length): the payload
+    // may carry secrets (e.g. a VERIFY PIN), so it must never be logged.
+    const clean = apdu.trim().replace(/\s+/g, "").toUpperCase();
+    const ins = clean.length >= 4 ? clean.slice(2, 4) : "??";
     try {
       const resp = await tauriApi.transmitHsm(device.live.reader, apdu.trim(), applet);
+      audit("diagnose.raw-apdu", `[${applet}] INS ${ins} (${clean.length / 2} bytes)`, "ok");
       setTrace((t) => [...t.slice(-9), { sent: `[${applet}] ${apdu.trim().toUpperCase()}`, resp }]);
     } catch (e) {
+      const err = e as DeviceError;
+      audit("diagnose.raw-apdu", `[${applet}] INS ${ins}`, "error", err?.code);
       setTrace((t) => [...t.slice(-9), { sent: `[${applet}] ${apdu.trim().toUpperCase()}`, resp: String((e as { message?: string })?.message ?? e) }]);
     } finally {
       setSending(false);

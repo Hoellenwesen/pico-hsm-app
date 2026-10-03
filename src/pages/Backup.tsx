@@ -400,8 +400,9 @@ function WrapCard({ device, domain, kcv }: { device: DeviceState; domain: number
           <Download size={16} className="text-primary" /> Wrapped-key backup
         </CardTitle>
         <CardDescription>
-          Wraps each key with its own domain DKEK into a versioned JSON bundle. Needs WRAP purpose
-          per key
+          Wraps each key with its own domain DKEK into a versioned JSON bundle. Keys without the
+          WRAP purpose are skipped (check key details); AES wrapping additionally needs a button
+          press on the device
           {kcv ? (
             <>
               {" "}· selected domain KCV <span className="font-mono">{kcv}</span>

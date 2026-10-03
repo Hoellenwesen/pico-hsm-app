@@ -367,7 +367,8 @@ function GenerateDialog({
           </div>
           {busy && (
             <p className="text-xs text-muted-foreground">
-              The device is busy — this can take minutes for large RSA keys. Polling pauses meanwhile.
+              The device is busy — this can take minutes for large RSA keys. Polling continues in
+              the background; the device answers when free.
             </p>
           )}
           <p className="text-xs text-muted-foreground">

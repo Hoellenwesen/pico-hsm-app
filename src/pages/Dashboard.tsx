@@ -33,16 +33,16 @@ import { formatBytes } from "../lib/format";
 import type { DeviceState } from "../hooks/useDevice";
 import type { PinStatus } from "../lib/tauri";
 
-function PinCounter({ pin, max }: { pin: PinStatus | null; max: number }) {
+function PinCounter({ pin }: { pin: PinStatus | null }) {
   if (!pin) return <NA />;
   if (pin.blocked) return <Badge variant="destructive">Blocked</Badge>;
   if (pin.retries < 0) return <Badge variant="info">No PIN required</Badge>;
+  // No "/ max": the configured maximum varies (init allows 1-15), only the
+  // remaining count is device truth. "Low" at 2 or fewer.
   return (
     <>
-      <span className="font-mono">
-        {pin.retries} / {max} left
-      </span>
-      {pin.retries < max && <Badge variant="warning">Low</Badge>}
+      <span className="font-mono">{pin.retries} left</span>
+      {pin.retries <= 2 && <Badge variant="warning">Low</Badge>}
     </>
   );
 }
@@ -256,10 +256,10 @@ export function Dashboard({ device, onSetup }: { device: DeviceState; onSetup: (
             )}
           </InfoRow>
           <InfoRow icon={KeyRound} label="UserPIN retries">
-            <PinCounter pin={device.live.pin} max={device.pinMax.user} />
+            <PinCounter pin={device.live.pin} />
           </InfoRow>
           <InfoRow icon={KeyRound} label="SOPIN retries">
-            <PinCounter pin={device.live.sopin} max={device.pinMax.so} />
+            <PinCounter pin={device.live.sopin} />
           </InfoRow>
           <InfoRow icon={MousePointerClick} label="Press-to-confirm">
             <OptBadge on={device.securityOpts?.pressConfirm} />

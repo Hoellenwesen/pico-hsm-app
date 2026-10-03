@@ -320,15 +320,12 @@ export function useDevice() {
           resetRetryCounter: (optsWord & 0x0001) !== 0,
           resetOnly: (optsWord & 0x0020) !== 0,
         };
-  // Firmware retry maxima (constants, no device source): UserPIN 3, SOPIN 15.
-  const pinMax = { user: 3, so: 15 };
   // Init state comes from the PIN probe (NotInitialized = 6A88), not from
   // heuristics. Offline -> unknown.
   const initState: InitState = live.present ? live.init : "unknown";
 
   // Memory from the rescue applet (FLASH INFO). Firmware size is only
   // reported on Pico targets (24-byte response) — otherwise N/A.
-  const firmwareLive = live.flash?.firmware_bytes != null;
 
   // Reconnect detection: leaving BOOTSEL/normal reboot returns as a fresh
   // presence — drop the bootsel view back to normal with a toast.
@@ -681,9 +678,7 @@ export function useDevice() {
     requestPin,
     dismissPin,
     now,
-    firmwareLive,
     securityOpts,
-    pinMax,
     initState,
     live,
     transportNote: live.transportNote,

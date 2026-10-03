@@ -18,7 +18,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# custom-protocol is REQUIRED for release builds: without it the app runs in
+# "dev" asset mode (empty embedded frontend, window loads devUrl). See docs.
+tauri = { version = "2", features = ["custom-protocol"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 pcsc = "2"
