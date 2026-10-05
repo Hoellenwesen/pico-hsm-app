@@ -9,9 +9,18 @@ import { Backup } from "./pages/Backup";
 import { Firmware } from "./pages/Firmware";
 import { Keys } from "./pages/Keys";
 import { Logs } from "./pages/Logs";
+import { LangProvider } from "./lib/i18n/LangContext";
 import { useDevice } from "./hooks/useDevice";
 
 export default function App() {
+  return (
+    <LangProvider>
+      <Shell />
+    </LangProvider>
+  );
+}
+
+function Shell() {
   const [tab, setTab] = useState<TabId>("dashboard");
   const [dark, setDark] = useState(true);
   const device = useDevice();

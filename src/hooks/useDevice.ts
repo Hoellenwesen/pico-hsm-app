@@ -93,20 +93,9 @@ export function useDevice() {
   // (Kept for upcoming authenticated commands; the rescue clock needs no auth.)
   const [sessionPin, setSessionPin] = useState<string | null>(null);
   const [pinRequired, setPinRequired] = useState(false);
-  // Ticker so the device clock re-renders every second.
-  const [, setTick] = useState(0);
-  // Host timestamp of the last RTC sample — the displayed time advances locally between polls.
-  const liveAt = useRef(Date.now());
+  // NOTE: no second-ticker here on purpose — the whole tree re-rendered every
+  // second just for the sidebar clock. The Sidebar owns a local Clock instead.
   const pollRef = useRef(0);
-
-  useEffect(() => {
-    const t = setInterval(() => setTick((n) => n + 1), 1000);
-    return () => clearInterval(t);
-  }, []);
-
-  useEffect(() => {
-    liveAt.current = Date.now();
-  }, [live.rtcDate]);
 
   // Live polling, two tiers for speed:
   // - fast (every 5 s): presence, ATR/protocol, RTC, PIN/SO-PIN retries.
@@ -302,8 +291,6 @@ export function useDevice() {
   }, [probeNonce]);
 
   const online = live.present;
-  // Clock: device RTC, advanced locally between polls; null (→ "--") without a device.
-  const now = !live.rtcDate ? null : new Date(live.rtcDate.getTime() + (Date.now() - liveAt.current));
   // Version: rescue applet first, SELECT-FCP as fallback.
   // No device -> nulls across the board (UI shows N/A badges).
   const versionDisplay = live.platform?.version ?? live.version?.display ?? null;
@@ -677,7 +664,6 @@ export function useDevice() {
     pinRequired,
     requestPin,
     dismissPin,
-    now,
     securityOpts,
     initState,
     live,

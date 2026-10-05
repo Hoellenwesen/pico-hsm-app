@@ -7,36 +7,59 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../co
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { NA } from "../components/ui/NA";
 import { ModalCancel, ModalShell } from "../components/ui/ModalShell";
+import { useLang } from "../lib/i18n/LangContext";
 import { deleteGenRecord, loadGenRecord, patchGenRecord, saveGenRecord } from "../lib/genRecords";
 import { tauriApi, type DeviceError, type KeyEntry } from "../lib/tauri";
 import type { DeviceState } from "../hooks/useDevice";
 
-function kindBadge(kind: string, fid: string) {
+function KindBadge({ kind, fid }: { kind: string; fid: string }) {
+  const { t } = useLang();
   switch (kind) {
     case "key":
       return (
-        <Badge variant="info" title={`Key material ${fid}`}>
+        <Badge variant="info" title={t("keys.badgeKey", { fid })}>
           {fid}
         </Badge>
       );
     case "prkd":
       return (
-        <Badge variant="outline" title={`Key description ${fid}`}>
+        <Badge variant="outline" title={t("keys.badgePrkd", { fid })}>
           {fid}
         </Badge>
       );
     case "cert":
       return (
-        <Badge variant="success" title={`Certificate ${fid}`}>
+        <Badge variant="success" title={t("keys.badgeCert", { fid })}>
           {fid}
         </Badge>
       );
     default:
       return (
-        <Badge variant="warning" title={`Unknown object ${fid}`}>
+        <Badge variant="warning" title={t("keys.badgeUnknown", { fid })}>
           {fid}
         </Badge>
       );
+  }
+}
+
+/** Purpose category id -> display label (shared by generate + details). */
+function purposeLabel(t: (k: string) => string, id: string | null): string | null {
+  if (id === null) return null;
+  switch (id) {
+    case "default":
+      return t("keys.purposeDefault");
+    case "sign":
+      return t("keys.purposeSign");
+    case "decrypt":
+      return t("keys.purposeDecrypt");
+    case "derive":
+      return t("keys.purposeDerive");
+    case "wrap":
+      return t("keys.purposeWrap");
+    case "custom":
+      return t("keys.purposeCustom");
+    default:
+      return id;
   }
 }
 
@@ -52,7 +75,7 @@ interface KeyGroup {
 }
 
 /** Group FID rows by key id: CC (key) + C4 (PRKD) + CE (cert) belong together. */
-function groupEntries(entries: KeyEntry[]): { groups: KeyGroup[]; singles: KeyEntry[] } {
+function groupEntries(entries: KeyEntry[], deviceKeyLabel: string): { groups: KeyGroup[]; singles: KeyEntry[] } {
   const byId = new Map<number, KeyEntry[]>();
   const singles: KeyEntry[] = [];
   for (const e of entries) {
@@ -69,7 +92,7 @@ function groupEntries(entries: KeyEntry[]): { groups: KeyGroup[]; singles: KeyEn
       const label =
         files.find((f) => f.fid.startsWith("C4"))?.label ??
         files.find((f) => f.label)?.label ??
-        (id === 0 ? "Device key" : null);
+        (id === 0 ? deviceKeyLabel : null);
       const labelFid =
         files.find((f) => f.fid.startsWith("C4"))?.fid ??
         files.find((f) => f.fid.startsWith("C8") || f.fid.startsWith("C9"))?.fid ??
@@ -104,24 +127,23 @@ const EC_CURVES = [
 
 interface PurposeDef {
   id: string;
-  label: string;
   bytes: number[];
 }
 
 const RSA_PURPOSES: PurposeDef[] = [
-  { id: "default", label: "Default (unrestricted)", bytes: [] },
-  { id: "sign", label: "Sign", bytes: [0x33, 0x43] },
-  { id: "decrypt", label: "Encrypt/Decrypt", bytes: [0x22, 0x23] },
-  { id: "wrap", label: "Wrap", bytes: [0x92, 0x93] },
-  { id: "custom", label: "Custom…", bytes: [] },
+  { id: "default", bytes: [] },
+  { id: "sign", bytes: [0x33, 0x43] },
+  { id: "decrypt", bytes: [0x22, 0x23] },
+  { id: "wrap", bytes: [0x92, 0x93] },
+  { id: "custom", bytes: [] },
 ];
 
 const EC_PURPOSES: PurposeDef[] = [
-  { id: "default", label: "Default (unrestricted)", bytes: [] },
-  { id: "sign", label: "Sign", bytes: [0x73] },
-  { id: "derive", label: "Derive", bytes: [0x80] },
-  { id: "wrap", label: "Wrap", bytes: [0x92, 0x93] },
-  { id: "custom", label: "Custom…", bytes: [] },
+  { id: "default", bytes: [] },
+  { id: "sign", bytes: [0x73] },
+  { id: "derive", bytes: [0x80] },
+  { id: "wrap", bytes: [0x92, 0x93] },
+  { id: "custom", bytes: [] },
 ];
 
 const RSA_CUSTOM: [number, string][] = [
@@ -159,6 +181,7 @@ function GenerateDialog({
   const [counter, setCounter] = useState(1000);
   const [purpose, setPurpose] = useState("default");
   const [customSel, setCustomSel] = useState<number[]>([]);
+  const { t, terr } = useLang();
 
   const slow = kind === "rsa" && bits >= 3072;
   const labelOk = label === "" || (label.length <= 64 && !/[\x00-\x1F\x7F]/.test(label));
@@ -194,14 +217,15 @@ function GenerateDialog({
           spkiHex: res.spki_hex ?? null,
         });
       }
-      toast.success("Key generated", { description: res.message });
+      toast.success(t("keys.generated"), { description: res.message });
       onDone();
     } catch (e) {
       const err = e as DeviceError;
       if (err?.auth_required) {
-        toast.info("Login required", { description: "Enter the User-PIN, then generate again." });
+        toast.info(t("common.loginRequired"), { description: t("common.loginAgain") });
       } else {
-        toast.error("Generation failed", { description: err.hint ? `${err.message}. ${err.hint}` : err.message });
+        const text = terr(err);
+        toast.error(t("keys.genFailed"), { description: text.hint ? `${text.message}. ${text.hint}` : text.message });
       }
     } finally {
       setBusy(false);
@@ -212,11 +236,10 @@ function GenerateDialog({
     <ModalShell onCancel={onClose} busy={busy}>
         <CardHeader>
           <CardTitle>
-            <Plus size={16} className="text-primary" /> Generate key
+            <Plus size={16} className="text-primary" /> {t("keys.genTitle")}
           </CardTitle>
           <CardDescription>
-            On-device generation — private material never leaves the HSM. ID is assigned automatically
-            (first free). {device.unlocked ? "Session unlocked." : "Needs User-PIN login."}
+            {t("keys.genSub", { session: device.unlocked ? t("keys.genUnlocked") : t("keys.genLocked") })}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -229,7 +252,7 @@ function GenerateDialog({
           </div>
           {kind === "ec" ? (
             <label className="block space-y-1">
-              <span className="text-xs font-medium text-muted-foreground">Curve (near-instant)</span>
+              <span className="text-xs font-medium text-muted-foreground">{t("keys.curveLabel")}</span>
               <select
                 value={curve}
                 disabled={busy}
@@ -246,7 +269,7 @@ function GenerateDialog({
           ) : (
           <label className="block space-y-1">
             <span className="text-xs font-medium text-muted-foreground">
-              {kind === "rsa" ? "Key size (bits)" : "Key size (bits, 512 = XTS double key)"}
+              {kind === "rsa" ? t("keys.sizeLabel") : t("keys.sizeLabelAes")}
             </span>
             <select
               value={bits}
@@ -265,10 +288,10 @@ function GenerateDialog({
           {kind !== "aes" ? (
             <>
               <div className="space-y-1">
-                <span className="text-xs font-medium text-muted-foreground">Usage limit</span>
+                <span className="text-xs font-medium text-muted-foreground">{t("keys.usageLimit")}</span>
                 <label className="flex cursor-pointer items-center gap-2 text-sm">
                   <input type="checkbox" checked={unlimited} disabled={busy} onChange={(e) => setUnlimited(e.currentTarget.checked)} />
-                  Unlimited {unlimited ? "" : ""}
+                  {t("keys.unlimited")}
                 </label>
                 {!unlimited && (
                   <span className="flex items-center gap-2">
@@ -286,12 +309,12 @@ function GenerateDialog({
                 )}
                 <p className="text-xs text-muted-foreground">
                   {unlimited
-                    ? "No counter stored (device default)."
-                    : "Each use decrements by 1 — at 0 the key is disabled."}
+                    ? t("keys.noCounter")
+                    : t("keys.counterDecrement")}
                 </p>
               </div>
               <div className="space-y-1">
-                <span className="text-xs font-medium text-muted-foreground">Purpose</span>
+                <span className="text-xs font-medium text-muted-foreground">{t("keys.purpose")}</span>
                 <div className="flex flex-wrap gap-1">
                   {purposes.map((p) => (
                     <Button
@@ -301,7 +324,7 @@ function GenerateDialog({
                       onClick={() => setPurpose(p.id)}
                       className="h-7 px-2 text-xs"
                     >
-                      {p.label}
+                      {purposeLabel(t, p.id)}
                     </Button>
                   ))}
                 </div>
@@ -327,7 +350,7 @@ function GenerateDialog({
                       ))}
                     </div>
                     <p className="text-xs text-amber-500">
-                      Wrong restrictions can render the key unusable for its job — Default is unrestricted.
+                      {t("keys.customWarn")}
                     </p>
                   </>
                 )}
@@ -335,45 +358,43 @@ function GenerateDialog({
             </>
           ) : (
             <p className="text-xs text-muted-foreground">
-              Usage limit and purpose are unsupported by the firmware for AES keys.
+              {t("keys.aesUnsupported")}
             </p>
           )}
           {slow && (
             <p className="rounded-lg bg-amber-500/10 p-3 text-xs text-amber-500">
-              RSA-{bits} blocks the device for many minutes (~17 min for 4096). Do not unplug.
+              {t("keys.slowWarn", { bits })}
               <label className="mt-2 flex cursor-pointer items-center gap-2 font-medium">
                 <input type="checkbox" checked={confirmedSlow} disabled={busy} onChange={(e) => setConfirmedSlow(e.currentTarget.checked)} />
-                I understand, generate anyway
+                {t("keys.slowConfirm")}
               </label>
             </p>
           )}
           <label className="block space-y-1">
-            <span className="text-xs font-medium text-muted-foreground">Label (optional, 1-64 chars)</span>
+            <span className="text-xs font-medium text-muted-foreground">{t("keys.labelLabel")}</span>
             <input
               value={label}
               disabled={busy}
               maxLength={64}
               onChange={(e) => setLabel(e.currentTarget.value)}
-              placeholder="e.g. Signing 2026"
+              placeholder={t("keys.labelPh")}
               className="h-9 w-full rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-primary"
             />
           </label>
-          {!labelOk && <p className="text-xs text-red-500">No control characters allowed.</p>}
+          {!labelOk && <p className="text-xs text-red-500">{t("keys.labelBad")}</p>}
           <div className="flex gap-2">
             <Button variant="primary" disabled={!canSubmit} onClick={() => void submit()}>
-              {busy ? "Generating… do not unplug" : "Generate"}
+              {busy ? t("keys.generating") : t("keys.generate")}
             </Button>
             <ModalCancel onCancel={onClose} busy={busy} />
           </div>
           {busy && (
             <p className="text-xs text-muted-foreground">
-              The device is busy — this can take minutes for large RSA keys. Polling continues in
-              the background; the device answers when free.
+              {t("keys.busyNote")}
             </p>
           )}
           <p className="text-xs text-muted-foreground">
-            If an error occurs, check the key list before retrying — the key may exist despite the error
-            (blind retries create duplicates, removable via Delete).
+            {t("keys.errorNote")}
           </p>
         </CardContent>
     </ModalShell>
@@ -393,13 +414,14 @@ function DeleteDialog({
   onClose: () => void;
   onConfirm: () => void;
 }) {
+  const { t } = useLang();
   const running = busy || (results.length > 0 && results.length < targets.length);
   const finished = results.length === targets.length && targets.length > 0;
   return (
     <ConfirmDialog
-      title={targets.length === 1 ? `Delete key ID ${targets[0].id}?` : `Delete ${targets.length} keys?`}
-      description="Irreversible without a DKEK backup. Missing files are skipped, the device key can never be selected."
-      confirmLabel={finished ? "Close" : targets.length === 1 ? "Delete" : `Delete ${targets.length}`}
+      title={targets.length === 1 ? t("keys.delTitleOne", { id: targets[0].id }) : t("keys.delTitleMany", { count: targets.length })}
+      description={t("keys.delDesc")}
+      confirmLabel={finished ? t("keys.delClose") : targets.length === 1 ? t("common.delete") : t("keys.delTitleMany", { count: targets.length })}
       danger={!finished}
       busy={busy}
       onConfirm={() => {
@@ -418,15 +440,15 @@ function DeleteDialog({
               </span>
               {!r ? (
                 running ? (
-                  <span className="text-xs text-muted-foreground">Deleting…</span>
+                  <span className="text-xs text-muted-foreground">{t("keys.deleting")}</span>
                 ) : (
-                  <span className="text-xs text-muted-foreground">Pending</span>
+                  <span className="text-xs text-muted-foreground">{t("keys.pending")}</span>
                 )
               ) : r.ok ? (
-                <Badge variant="success">Deleted</Badge>
+                <Badge variant="success">{t("keys.deleted")}</Badge>
               ) : (
                 <Badge variant="destructive" title={r.text}>
-                  Failed
+                  {t("keys.failed")}
                 </Badge>
               )}
             </li>
@@ -456,6 +478,7 @@ function DetailsDialog({
   const [details, setDetails] = useState<import("../lib/tauri").KeyDetails | null>(null);
   const [error, setError] = useState<string | null>(null);
   const record = loadGenRecord(serial, group.id);
+  const { t, terr } = useLang();
 
   useEffect(() => {
     let cancelled = false;
@@ -466,14 +489,14 @@ function DetailsDialog({
       })
       .catch((e) => {
         if (!cancelled) {
-          const err = e as DeviceError;
-          setError(err.hint ? `${err.message}. ${err.hint}` : err.message || String(e));
+          const text = terr(e as DeviceError);
+          setError(text.hint ? `${text.message}. ${text.hint}` : text.message);
         }
       });
     return () => {
       cancelled = true;
     };
-  }, [reader, group.id]);
+  }, [reader, group.id, terr]);
 
   // Generation record (this computer) wins; device-derived values fill gaps.
   // Mismatch guard, precise: only an AUTHORITATIVE device reading (CE-CVC
@@ -498,22 +521,15 @@ function DetailsDialog({
   const counterText =
     rec && rec.kind !== "aes"
       ? rec.counter != null
-        ? `${rec.counter} (initial limit)`
-        : "Unlimited (at generation)"
+        ? t("keys.detCounterInitial", { n: rec.counter })
+        : t("keys.detCounterUnlimited")
       : null;
-  const PURPOSE_LABELS: Record<string, string> = {
-    sign: "Sign",
-    decrypt: "Encrypt/Decrypt",
-    derive: "Derive",
-    wrap: "Wrap",
-    custom: "Custom",
-  };
-  // Category badge only: "All" when unrestricted at generation, the chosen
-  // category otherwise. No algorithm details (curve-independent anyway —
+  // Category badge only: unrestricted at generation, the chosen category
+  // otherwise. No algorithm details (curve-independent anyway —
   // e.g. ECDSA-SHA256 is just the hash function, valid for any curve).
   const purposeBadge: string | null = !rec
     ? null
-    : (rec.purpose ? (PURPOSE_LABELS[rec.purpose] ?? rec.purpose) : "All");
+    : (rec.purpose ? (purposeLabel(t, rec.purpose) ?? rec.purpose) : t("keys.purposeAll"));
 
   // Static PKCS#15 usage word (OpenSC vocabulary) — NOT the configured
   // GAK-0x91 restrictions (those are write-only). Verified against
@@ -543,71 +559,71 @@ function DetailsDialog({
       <div className="max-h-[85vh] overflow-y-auto">
         <CardHeader>
           <CardTitle>
-            <Info size={16} className="text-primary" /> Key ID {group.id} — details
+            <Info size={16} className="text-primary" /> {t("keys.detTitle", { id: group.id })}
           </CardTitle>
           <CardDescription>
-            {group.label ?? "No label"} · {group.files.map((f) => f.fid).join(", ")}
+            {group.label ?? t("keys.detNoLabel")} · {group.files.map((f) => f.fid).join(", ")}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
           {rec && (
             <p className="text-xs text-muted-foreground">
-              <Badge variant="outline" title={`Recorded on this computer at ${rec.createdAt}`}>
-                Recorded at generation
+              <Badge variant="outline" title={t("keys.detRecordedTitle", { ts: rec.createdAt })}>
+                {t("keys.detRecorded")}
               </Badge>
             </p>
           )}
           {recordMismatch && (
             <p className="text-xs text-amber-500">
-              Stored record mismatches the device (ID likely reused) — ignored, showing device values.
+              {t("keys.detMismatch")}
             </p>
           )}
           <div className="flex items-center justify-between gap-3">
-            <span className="text-muted-foreground">Key type</span>
+            <span className="text-muted-foreground">{t("keys.detKeyType")}</span>
             {keyType ? (
               <Badge variant="info">{keyType}</Badge>
             ) : !details && !error ? (
-              <span className="text-xs text-muted-foreground">Reading…</span>
+              <span className="text-xs text-muted-foreground">{t("keys.detReading")}</span>
             ) : error && !record ? (
-              <span className="text-xs text-red-500">Error</span>
+              <span className="text-xs text-red-500">{t("keys.detError")}</span>
             ) : (
               <NA />
             )}
           </div>
           <div className="flex items-center justify-between gap-3">
-            <span className="text-muted-foreground">Curve</span>
-            {curve ?? (!details && !error ? <span className="text-xs text-muted-foreground">Reading…</span> : error && !record ? <span className="text-xs text-red-500">Error</span> : <NA />)}
+            <span className="text-muted-foreground">{t("keys.detCurve")}</span>
+            {curve ?? (!details && !error ? <span className="text-xs text-muted-foreground">{t("keys.detReading")}</span> : error && !record ? <span className="text-xs text-red-500">{t("keys.detError")}</span> : <NA />)}
           </div>
           <div className="flex items-center justify-between gap-3">
-            <span className="text-muted-foreground">Size</span>
+            <span className="text-muted-foreground">{t("keys.detSize")}</span>
             {sizeBits != null ? (
-              <span className="font-mono">{sizeBits} bits</span>
+              <span className="font-mono">{t("keys.detBits", { bits: sizeBits })}</span>
             ) : !details && !error ? (
-              <span className="text-xs text-muted-foreground">Reading…</span>
+              <span className="text-xs text-muted-foreground">{t("keys.detReading")}</span>
             ) : error && !record ? (
-              <span className="text-xs text-red-500">Error</span>
+              <span className="text-xs text-red-500">{t("keys.detError")}</span>
             ) : (
               <NA />
             )}
           </div>
           <div className="flex items-center justify-between gap-3">
-            <span className="text-muted-foreground">Usage</span>
-            {usageText ?? (!details && !error ? <span className="text-xs text-muted-foreground">Reading…</span> : error && !details?.usage ? <span className="text-xs text-red-500">Error</span> : <NA />)}
+            <span className="text-muted-foreground">{t("keys.detUsage")}</span>
+            {usageText ?? (!details && !error ? <span className="text-xs text-muted-foreground">{t("keys.detReading")}</span> : error && !details?.usage ? <span className="text-xs text-red-500">{t("keys.detError")}</span> : <NA />)}
           </div>
           <div className="flex items-center justify-between gap-3">
-            <span className="text-muted-foreground">Use counter</span>
+            <span className="text-muted-foreground">{t("keys.detCounter")}</span>
             {counterText ?? (
-              <Badge variant="muted" title="Live usage counters are not exposed by the firmware over APDU">
+              <Badge variant="muted" title={t("keys.detCounterNa")}>
                 N/A
               </Badge>
             )}
           </div>
           <div className="flex items-center justify-between gap-3">
-            <span className="text-muted-foreground">Purposes</span>
+            <span className="text-muted-foreground">{t("keys.detPurposes")}</span>
             {purposeBadge ? (
               <Badge variant="outline">{purposeBadge}</Badge>
             ) : (
-              <Badge variant="muted" title="No generation record on this computer and nothing readable back from the device">
+              <Badge variant="muted" title={t("keys.detPurposesNa")}>
                 N/A
               </Badge>
             )}
@@ -638,6 +654,7 @@ function CsrDialog({
   const [ou, setOu] = useState("");
   const [c, setC] = useState("");
   const [busy, setBusy] = useState(false);
+  const { t, terr } = useLang();
   const printable = (s: string) => s.length <= 64 && !/[\x00-\x1F\x7F]/.test(s);
   const cnOk = cn.trim().length >= 1 && cn.trim().length <= 64 && printable(cn.trim());
   const oOk = o.trim() === "" || (printable(o.trim()) && o.trim().length >= 1);
@@ -663,14 +680,15 @@ function CsrDialog({
       a.download = `key-${id}.csr.pem`;
       a.click();
       URL.revokeObjectURL(url);
-      toast.success("CSR exported", { description: `Signed on-device by key ID ${id}.` });
+      toast.success(t("keys.csrExported"), { description: t("keys.csrExportedHint", { id }) });
       onClose();
     } catch (e) {
       const err = e as DeviceError;
       if (err?.auth_required) {
-        toast.info("Login required", { description: "Enter the User-PIN, then export again." });
+        toast.info(t("common.loginRequired"), { description: t("common.loginAgain") });
       } else {
-        toast.error("CSR failed", { description: err.hint ? `${err.message}. ${err.hint}` : err.message });
+        const text = terr(err);
+        toast.error(t("keys.csrFailed"), { description: text.hint ? `${text.message}. ${text.hint}` : text.message });
       }
     } finally {
       setBusy(false);
@@ -683,35 +701,34 @@ function CsrDialog({
     <ModalShell onCancel={onClose} busy={busy}>
       <CardHeader>
         <CardTitle>
-          <FileSignature size={16} className="text-primary" /> CSR for key ID {id}
+          <FileSignature size={16} className="text-primary" /> {t("keys.csrDialogTitle", { id })}
         </CardTitle>
         <CardDescription>
-          PKCS#10, signed on-device (SHA-256). Needs a stored certificate or a generation record
-          from this computer for the public key. Uses one key-counter step when limited.
+          {t("keys.csrDialogSub")}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3 text-sm">
         <label className="block">
-          <span className="mb-1 block text-xs text-muted-foreground">Common Name (required)</span>
+          <span className="mb-1 block text-xs text-muted-foreground">{t("keys.csrCn")}</span>
           <input value={cn} maxLength={64} onChange={(e) => setCn(e.target.value)} className={inputCls} placeholder="pico.example" />
-          {!cnOk && cn !== "" && <span className="text-xs text-red-500">1–64 printable characters.</span>}
+          {!cnOk && cn !== "" && <span className="text-xs text-red-500">{t("keys.csrCnBad")}</span>}
         </label>
         <label className="block">
-          <span className="mb-1 block text-xs text-muted-foreground">Organization (optional)</span>
+          <span className="mb-1 block text-xs text-muted-foreground">{t("keys.csrO")}</span>
           <input value={o} maxLength={64} onChange={(e) => setO(e.target.value)} className={inputCls} />
         </label>
         <label className="block">
-          <span className="mb-1 block text-xs text-muted-foreground">Organizational Unit (optional)</span>
+          <span className="mb-1 block text-xs text-muted-foreground">{t("keys.csrOu")}</span>
           <input value={ou} maxLength={64} onChange={(e) => setOu(e.target.value)} className={inputCls} />
         </label>
         <label className="block">
-          <span className="mb-1 block text-xs text-muted-foreground">Country, 2 letters (optional)</span>
+          <span className="mb-1 block text-xs text-muted-foreground">{t("keys.csrC")}</span>
           <input value={c} maxLength={2} onChange={(e) => setC(e.target.value)} className={inputCls} placeholder="DE" />
-          {!cOk && <span className="text-xs text-red-500">Exactly 2 letters or empty.</span>}
+          {!cOk && <span className="text-xs text-red-500">{t("keys.csrCBad")}</span>}
         </label>
         <div className="flex gap-2 pt-1">
           <Button variant="primary" disabled={!canSubmit} onClick={() => void submit()}>
-            {busy ? "Signing…" : "Export CSR"}
+            {busy ? t("keys.csrSigning") : t("keys.csrExport")}
           </Button>
           <ModalCancel onCancel={onClose} busy={busy} />
         </div>
@@ -721,6 +738,7 @@ function CsrDialog({
 }
 
 export function Keys({ device }: { device: DeviceState }) {
+  const { t, terr } = useLang();
   const [entries, setEntries] = useState<KeyEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -737,19 +755,19 @@ export function Keys({ device }: { device: DeviceState }) {
       setEntries(await tauriApi.keys(reader));
       setError(null);
     } catch (e) {
-      const err = e as DeviceError;
+      const text = terr(e as DeviceError);
       setEntries(null);
-      setError(err.hint ? `${err.message}. ${err.hint}` : err.message || String(e));
+      setError(text.hint ? `${text.message}. ${text.hint}` : text.message);
     } finally {
       setBusy(false);
     }
-  }, [reader]);
+  }, [reader, terr]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
-  const { groups, singles } = useMemo(() => groupEntries(entries ?? []), [entries]);
+  const { groups, singles } = useMemo(() => groupEntries(entries ?? [], t("keys.deviceKey")), [entries, t]);
   const [showGen, setShowGen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editValue, setEditValue] = useState("");
@@ -786,19 +804,19 @@ export function Keys({ device }: { device: DeviceState }) {
       setDeleteDone(results.map((r) => ({ ...r })));
       try {
         const res = await device.deleteKey(g.id);
-        const parts = [`Deleted: ${res.deleted.join(", ") || "—"}`];
-        if (res.missing.length > 0) parts.push(`Absent: ${res.missing.join(", ")}`);
+        const parts = [`${t("keys.delDeleted")}: ${res.deleted.join(", ") || "—"}`];
+        if (res.missing.length > 0) parts.push(`${t("keys.delAbsent")}: ${res.missing.join(", ")}`);
         results.push({ id: g.id, label: g.label, ok: true, text: parts.join(" ") });
         deleteGenRecord(device.device.serial, g.id);
       } catch (e) {
         const err = e as DeviceError;
         if (err?.auth_required) {
-          toast.info("Login required", { description: "Enter the User-PIN, then delete again." });
-          results.push({ id: g.id, label: g.label, ok: false, text: "Stopped: login required." });
+          toast.info(t("common.loginRequired"), { description: t("common.loginAgain") });
+          results.push({ id: g.id, label: g.label, ok: false, text: t("keys.delStopped") });
           break;
         }
-        const text = err.hint ? `${err.message}. ${err.hint}` : err.message || String(e);
-        results.push({ id: g.id, label: g.label, ok: false, text });
+        const text = terr(err);
+        results.push({ id: g.id, label: g.label, ok: false, text: text.hint ? `${text.message}. ${text.hint}` : text.message });
         break;
       }
     }
@@ -825,16 +843,17 @@ export function Keys({ device }: { device: DeviceState }) {
     setSaving(true);
     try {
       const msg = await device.renameLabel(g.labelFid, value);
-      toast.success("Label updated", { description: msg });
+      toast.success(t("keys.labelUpdated"), { description: msg });
       patchGenRecord(device.device.serial, g.id, { label: value });
       setEditingId(null);
       await load();
     } catch (e) {
       const err = e as DeviceError;
       if (err?.auth_required) {
-        toast.info("Login required", { description: "Enter the User-PIN, then save again." });
+        toast.info(t("common.loginRequired"), { description: t("common.loginAgain") });
       } else {
-        toast.error("Rename failed", { description: err.hint ? `${err.message}. ${err.hint}` : err.message });
+        const text = terr(err);
+        toast.error(t("keys.renameFailed"), { description: text.hint ? `${text.message}. ${text.hint}` : text.message });
       }
     } finally {
       setSaving(false);
@@ -845,14 +864,14 @@ export function Keys({ device }: { device: DeviceState }) {
     <div className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold tracking-tight">Keys</h1>
+          <h1 className="text-xl font-bold tracking-tight">{t("keys.title")}</h1>
           <p className="text-sm text-muted-foreground">
-            On-device objects (ENUMERATE OBJECTS), grouped by key ID.
+            {t("keys.subtitle")}
           </p>
         </div>
         <div className="flex gap-2">
           <Button variant="primary" disabled={!device.online || busy} onClick={() => setShowGen(true)}>
-            <Plus size={15} /> Generate
+            <Plus size={15} /> {t("keys.generate")}
           </Button>
           <Button
             variant="outline"
@@ -860,10 +879,10 @@ export function Keys({ device }: { device: DeviceState }) {
             onClick={() => setDeleteTargets(groups.filter((g) => selected.includes(g.id)))}
             className={selected.length > 0 ? "border-red-500/50 text-red-500 hover:bg-red-500/10" : undefined}
           >
-            <Trash2 size={15} /> Delete selected{selected.length > 0 ? ` (${selected.length})` : ""}
+            <Trash2 size={15} /> {selected.length > 0 ? t("keys.deleteSelectedN", { count: selected.length }) : t("keys.deleteSelected")}
           </Button>
           <Button variant="outline" disabled={!device.online || busy} onClick={() => void load()}>
-            <RefreshCw size={15} /> Refresh
+            <RefreshCw size={15} /> {t("keys.refresh")}
           </Button>
         </div>
       </div>
@@ -892,15 +911,15 @@ export function Keys({ device }: { device: DeviceState }) {
       <Card>
         <CardHeader>
           <CardTitle>
-            <KeyRound size={16} className="text-primary" /> Keys
+            <KeyRound size={16} className="text-primary" /> {t("keys.title")}
           </CardTitle>
           <CardDescription>
             {reader ? (
               <>
-                Reader: <span className="font-mono">{reader}</span>
+                {t("keys.readerLabel")} <span className="font-mono">{reader}</span>
               </>
             ) : (
-              "No board connected."
+              t("keys.noBoard")
             )}
           </CardDescription>
         </CardHeader>
@@ -910,10 +929,10 @@ export function Keys({ device }: { device: DeviceState }) {
           ) : error ? (
             <p className="text-sm text-red-500">{error}</p>
           ) : entries === null ? (
-            <p className="text-sm text-muted-foreground">{busy ? "Reading…" : "—"}</p>
+            <p className="text-sm text-muted-foreground">{busy ? t("common.loading") : t("common.none")}</p>
           ) : groups.length === 0 && singles.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              No keys stored. Use Generate to create one.
+              {t("keys.noKeys")}
             </p>
           ) : (
             <div className="overflow-x-auto">
@@ -923,7 +942,7 @@ export function Keys({ device }: { device: DeviceState }) {
                     <th className="w-8 py-2 pr-2">
                       <input
                         type="checkbox"
-                        title={allChecked ? "Deselect all" : "Select all"}
+                        title={allChecked ? t("keys.deselectAll") : t("keys.selectAll")}
                         checked={allChecked}
                         ref={(el) => {
                           if (el) el.indeterminate = someChecked && !allChecked;
@@ -932,10 +951,10 @@ export function Keys({ device }: { device: DeviceState }) {
                         className="h-4 w-4 accent-current"
                       />
                     </th>
-                    <th className="py-2 pr-4 font-medium">ID</th>
-                    <th className="py-2 pr-4 font-medium">Label</th>
-                    <th className="py-2 pr-4 font-medium">Files</th>
-                    <th className="py-2 pr-4 font-medium">Actions</th>
+                    <th className="py-2 pr-4 font-medium">{t("keys.colId")}</th>
+                    <th className="py-2 pr-4 font-medium">{t("keys.colLabel")}</th>
+                    <th className="py-2 pr-4 font-medium">{t("keys.colFiles")}</th>
+                    <th className="py-2 pr-4 font-medium">{t("keys.colActions")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -945,7 +964,7 @@ export function Keys({ device }: { device: DeviceState }) {
                         {!g.isDevice && (
                           <input
                             type="checkbox"
-                            title={`Select key ID ${g.id}`}
+                            title={t("keys.selectId", { id: g.id })}
                             checked={selected.includes(g.id)}
                             onChange={() => toggleSelect(g.id)}
                             className="h-4 w-4 accent-current"
@@ -955,8 +974,8 @@ export function Keys({ device }: { device: DeviceState }) {
                       <td className="py-2 pr-4 font-mono">
                         {g.id}
                         {g.isDevice && (
-                          <span className="ml-2" title="Internal device key for attestation — cannot be deleted">
-                            <Badge variant="outline">System</Badge>
+                          <span className="ml-2" title={t("keys.systemTitle")}>
+                            <Badge variant="outline">{t("keys.systemBadge")}</Badge>
                           </span>
                         )}
                       </td>
@@ -975,10 +994,10 @@ export function Keys({ device }: { device: DeviceState }) {
                               className="h-7 w-40 rounded-md border border-border bg-background px-2 text-sm outline-none focus:border-primary"
                             />
                             <Button variant="primary" disabled={saving} onClick={() => void saveEdit(g)} className="h-7 px-2 text-xs">
-                              Save
+                              {t("common.save")}
                             </Button>
                             <Button variant="ghost" onClick={() => setEditingId(null)} className="h-7 px-2 text-xs">
-                              Cancel
+                              {t("common.cancel")}
                             </Button>
                           </span>
                         ) : (
@@ -988,14 +1007,14 @@ export function Keys({ device }: { device: DeviceState }) {
                       <td className="py-2 pr-4">
                         <span className="flex flex-wrap gap-1">
                           {g.files.map((f) => (
-                            <span key={f.fid}>{kindBadge(f.kind, f.fid)}</span>
+                            <span key={f.fid}><KindBadge kind={f.kind} fid={f.fid} /></span>
                           ))}
                         </span>
                       </td>
                       <td className="py-2 pr-4">
                         <span className="flex items-center gap-1">
                           <button
-                            title={`Details of key ID ${g.id}`}
+                            title={t("keys.detailsTitle", { id: g.id })}
                             onClick={() => setDetailsId(g.id)}
                             className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
                           >
@@ -1003,7 +1022,7 @@ export function Keys({ device }: { device: DeviceState }) {
                           </button>
                           {!g.isDevice && g.labelFid && editingId !== g.id && (
                             <button
-                              title={`Rename (writes ${g.labelFid})`}
+                              title={t("keys.renameTitle", { fid: g.labelFid })}
                               onClick={() => startEdit(g)}
                               className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
                             >
@@ -1012,7 +1031,7 @@ export function Keys({ device }: { device: DeviceState }) {
                           )}
                           {!g.isDevice && (
                             <button
-                              title={`Delete key ID ${g.id}`}
+                              title={t("keys.deleteTitle", { id: g.id })}
                               onClick={() => setDeleteTargets([g])}
                               className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
                             >
@@ -1021,7 +1040,7 @@ export function Keys({ device }: { device: DeviceState }) {
                           )}
                           {!g.isDevice && (
                             <button
-                              title={`Export certificate signing request (CSR) for key ID ${g.id}`}
+                              title={t("keys.csrTitle", { id: g.id })}
                               onClick={() => setCsrId(g.id)}
                               className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
                             >
@@ -1038,7 +1057,7 @@ export function Keys({ device }: { device: DeviceState }) {
                       <td className="py-2 pr-4 font-mono">{k.id}</td>
                       <td className="py-2 pr-4">{k.label ?? <NA />}</td>
                       <td className="py-2 pr-4">
-                        <span className="flex flex-wrap gap-1">{kindBadge(k.kind, k.fid)}</span>
+                        <span className="flex flex-wrap gap-1"><KindBadge kind={k.kind} fid={k.fid} /></span>
                       </td>
                       <td className="py-2 pr-4" />
                     </tr>

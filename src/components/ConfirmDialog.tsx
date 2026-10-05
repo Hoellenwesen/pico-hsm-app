@@ -1,6 +1,7 @@
 import { Button } from "./ui/Button";
 import { CardContent, CardDescription, CardHeader, CardTitle } from "./ui/Card";
 import { ModalCancel, ModalShell } from "./ui/ModalShell";
+import { useLang } from "../lib/i18n/LangContext";
 
 /**
  * Generic OK/Cancel modal. Destructive actions pass a red confirm button;
@@ -10,7 +11,7 @@ import { ModalCancel, ModalShell } from "./ui/ModalShell";
 export function ConfirmDialog({
   title,
   description,
-  confirmLabel = "Confirm",
+  confirmLabel,
   danger = false,
   busy = false,
   onConfirm,
@@ -26,6 +27,8 @@ export function ConfirmDialog({
   onCancel: () => void;
   children?: React.ReactNode;
 }) {
+  const { t } = useLang();
+  const label = confirmLabel ?? t("common.confirm");
   return (
     <ModalShell onCancel={onCancel} busy={busy}>
       <CardHeader>
@@ -41,7 +44,7 @@ export function ConfirmDialog({
             onClick={onConfirm}
             className={danger ? "bg-red-600 text-white hover:bg-red-600/90" : undefined}
           >
-            {busy ? "Working…" : confirmLabel}
+            {busy ? t("common.working") : label}
           </Button>
           <ModalCancel onCancel={onCancel} busy={busy} />
         </div>

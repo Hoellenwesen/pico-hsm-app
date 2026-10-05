@@ -7,9 +7,11 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../co
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { NA } from "../components/ui/NA";
 import { tauriApi, type CertEntry, type DeviceError } from "../lib/tauri";
+import { useLang } from "../lib/i18n/LangContext";
 import type { DeviceState } from "../hooks/useDevice";
 
 export function Certificates({ device }: { device: DeviceState }) {
+  const { t, terr } = useLang();
   const [entries, setEntries] = useState<CertEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -33,13 +35,13 @@ export function Certificates({ device }: { device: DeviceState }) {
       setEntries(await tauriApi.certs(reader));
       setError(null);
     } catch (e) {
-      const err = e as DeviceError;
+      const text = terr(e as DeviceError);
       setEntries(null);
-      setError(err.hint ? `${err.message}. ${err.hint}` : err.message || String(e));
+      setError(text.hint ? `${text.message}. ${text.hint}` : text.message);
     } finally {
       setBusy(false);
     }
-  }, [reader]);
+  }, [reader, terr]);
 
   useEffect(() => {
     void load();
@@ -50,15 +52,16 @@ export function Certificates({ device }: { device: DeviceState }) {
     setDeleting(true);
     try {
       const msg = await device.deleteCert(fid);
-      toast.success("Certificate deleted", { description: msg });
+      toast.success(t("certs.deleted"), { description: msg });
       setConfirmFid(null);
       await load();
     } catch (e) {
       const err = e as DeviceError;
       if (err?.auth_required) {
-        toast.info("Login required", { description: "Enter the User-PIN, then delete again." });
+        toast.info(t("common.loginRequired"), { description: t("common.loginAgain") });
       } else {
-        toast.error("Delete failed", { description: err.hint ? `${err.message}. ${err.hint}` : err.message });
+        const text = terr(err);
+        toast.error(t("certs.deleteFailed"), { description: text.hint ? `${text.message}. ${text.hint}` : text.message });
       }
     } finally {
       setDeleting(false);
@@ -78,15 +81,16 @@ export function Certificates({ device }: { device: DeviceState }) {
       a.download = isX509 ? `${cert.fid}-cert.pem` : `${cert.fid}-pubkey.pem`;
       a.click();
       URL.revokeObjectURL(url);
-      toast.success(isX509 ? "Certificate downloaded" : "Public key exported", {
-        description: `${cert.fid} as PEM.`,
+      toast.success(isX509 ? t("certs.downloaded") : t("certs.exported"), {
+        description: t("certs.asPem", { fid: cert.fid }),
       });
     } catch (e) {
       const err = e as DeviceError;
       if (err?.auth_required) {
-        toast.info("Login required", { description: "Enter the User-PIN, then try again." });
+        toast.info(t("common.loginRequired"), { description: t("common.loginAgain") });
       } else {
-        toast.error("Download failed", { description: err.hint ? `${err.message}. ${err.hint}` : err.message });
+        const text = terr(err);
+        toast.error(t("certs.downloadFailed"), { description: text.hint ? `${text.message}. ${text.hint}` : text.message });
       }
     } finally {
       setDownloading(null);
@@ -103,7 +107,7 @@ export function Certificates({ device }: { device: DeviceState }) {
   async function onImportFile(file: File | undefined) {
     if (!file || !importTarget) return;
     if (file.size > 8192) {
-      toast.error("File too large", { description: "Certificates are capped at 8192 bytes." });
+      toast.error(t("certs.fileTooLarge"), { description: t("certs.fileTooLargeHint") });
       return;
     }
     const buf = await file.arrayBuffer();
@@ -115,15 +119,16 @@ export function Certificates({ device }: { device: DeviceState }) {
     setImporting(true);
     try {
       const msg = await device.importCert(pendingImport.entry.id, pendingImport.bytes);
-      toast.success("Certificate imported", { description: msg });
+      toast.success(t("certs.imported"), { description: msg });
       setPendingImport(null);
       await load();
     } catch (e) {
       const err = e as DeviceError;
       if (err?.auth_required) {
-        toast.info("Login required", { description: "Enter the User-PIN, then import again." });
+        toast.info(t("common.loginRequired"), { description: t("common.loginAgain") });
       } else {
-        toast.error("Import failed", { description: err.hint ? `${err.message}. ${err.hint}` : err.message });
+        const text = terr(err);
+        toast.error(t("certs.importFailed"), { description: text.hint ? `${text.message}. ${text.hint}` : text.message });
       }
     } finally {
       setImporting(false);
@@ -134,28 +139,28 @@ export function Certificates({ device }: { device: DeviceState }) {
     <div className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold tracking-tight">Certificates</h1>
+          <h1 className="text-xl font-bold tracking-tight">{t("certs.title")}</h1>
           <p className="text-sm text-muted-foreground">
-            Key certificates (device CVC or imported X.509) plus the CA store.
+            {t("certs.subtitle")}
           </p>
         </div>
         <Button variant="outline" disabled={!device.online || busy} onClick={() => void load()}>
-          <RefreshCw size={15} /> Refresh
+          <RefreshCw size={15} /> {t("common.refresh")}
         </Button>
       </div>
 
       <Card>
         <CardHeader>
           <CardTitle>
-            <Award size={16} className="text-primary" /> Certificates
+            <Award size={16} className="text-primary" /> {t("certs.title")}
           </CardTitle>
           <CardDescription>
             {reader ? (
               <>
-                Reader: <span className="font-mono">{reader}</span>
+                {t("certs.reader")} <span className="font-mono">{reader}</span>
               </>
             ) : (
-              "No board connected."
+              t("certs.noBoard")
             )}
           </CardDescription>
         </CardHeader>
@@ -165,20 +170,20 @@ export function Certificates({ device }: { device: DeviceState }) {
           ) : error ? (
             <p className="text-sm text-red-500">{error}</p>
           ) : entries === null ? (
-            <p className="text-sm text-muted-foreground">{busy ? "Reading…" : "—"}</p>
+            <p className="text-sm text-muted-foreground">{busy ? t("common.loading") : t("common.none")}</p>
           ) : entries.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No keys on the device — nothing to show certificates for.</p>
+            <p className="text-sm text-muted-foreground">{t("certs.empty")}</p>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                    <th className="py-2 pr-4 font-medium">Key ID</th>
-                    <th className="py-2 pr-4 font-medium">Label</th>
-                    <th className="py-2 pr-4 font-medium">Certificate</th>
-                    <th className="py-2 pr-4 font-medium">Type</th>
-                    <th className="py-2 pr-4 font-medium">Size</th>
-                    <th className="py-2 pr-4 font-medium">Actions</th>
+                    <th className="py-2 pr-4 font-medium">{t("certs.colKeyId")}</th>
+                    <th className="py-2 pr-4 font-medium">{t("certs.colLabel")}</th>
+                    <th className="py-2 pr-4 font-medium">{t("certs.colCert")}</th>
+                    <th className="py-2 pr-4 font-medium">{t("certs.colType")}</th>
+                    <th className="py-2 pr-4 font-medium">{t("certs.colSize")}</th>
+                    <th className="py-2 pr-4 font-medium">{t("certs.colActions")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -190,13 +195,13 @@ export function Certificates({ device }: { device: DeviceState }) {
                         {c.has_cert ? (
                           <Badge
                             variant="success"
-                            title={`Stored as ${c.fid}${c.format !== "unknown" ? ` (${c.format.toUpperCase()})` : ""}`}
+                            title={t("certs.storedTitle", { fid: c.fid, format: c.format !== "unknown" ? ` (${c.format.toUpperCase()})` : "" })}
                           >
-                            Stored
+                            {t("certs.stored")}
                           </Badge>
                         ) : (
-                          <Badge variant="muted" title="This firmware generation stores no EE file for the key">
-                            None stored
+                          <Badge variant="muted" title={t("certs.noneStoredTitle")}>
+                            {t("certs.noneStored")}
                           </Badge>
                         )}
                       </td>
@@ -223,8 +228,8 @@ export function Certificates({ device }: { device: DeviceState }) {
                             <button
                               title={
                                 c.format === "x509"
-                                  ? `Download stored X.509 certificate ${c.fid} as PEM`
-                                  : `Export public key of ${c.fid} as PEM`
+                                  ? t("certs.downloadX509", { fid: c.fid })
+                                  : t("certs.downloadPubkey", { fid: c.fid })
                               }
                               disabled={downloading !== null}
                               onClick={() => void downloadPem(c)}
@@ -235,7 +240,7 @@ export function Certificates({ device }: { device: DeviceState }) {
                           ) : null}
                           {c.kind === "ee" && c.id !== 0 && (
                             <button
-                              title={`Import X.509 certificate onto key ${c.id} (${c.fid})`}
+                              title={t("certs.importTitle", { id: c.id, fid: c.fid })}
                               onClick={() => pickImportFile(c)}
                               className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
                             >
@@ -244,7 +249,7 @@ export function Certificates({ device }: { device: DeviceState }) {
                           )}
                           {c.kind === "ca" && (
                             <button
-                              title={`Delete CA certificate ${c.fid}`}
+                              title={t("certs.deleteCaTitle", { fid: c.fid })}
                               onClick={() => setConfirmFid(c.fid)}
                               className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
                             >
@@ -264,9 +269,9 @@ export function Certificates({ device }: { device: DeviceState }) {
 
       {confirmFid !== null && (
         <ConfirmDialog
-          title={`Delete certificate ${confirmFid}?`}
-          description="Removes the standalone CA certificate. Key certificates are deleted with their key group in the Keys tab."
-          confirmLabel="Delete"
+          title={t("certs.delTitle", { fid: confirmFid })}
+          description={t("certs.delDesc")}
+          confirmLabel={t("common.delete")}
           danger
           busy={deleting}
           onConfirm={() => void removeCert(confirmFid)}
@@ -285,13 +290,13 @@ export function Certificates({ device }: { device: DeviceState }) {
       />
       {pendingImport !== null && (
         <ConfirmDialog
-          title={`Import certificate onto key ${pendingImport.entry.id}?`}
+          title={t("certs.importAsk", { id: pendingImport.entry.id })}
           description={
             pendingImport.entry.has_cert
-              ? `Replaces the stored certificate ${pendingImport.entry.fid} with the selected file (${pendingImport.bytes.length} bytes). The previous content is restored if the write fails.`
-              : `Stores the selected file (${pendingImport.bytes.length} bytes) as ${pendingImport.entry.fid}. The file must be an X.509 certificate for this key.`
+              ? t("certs.importReplace", { fid: pendingImport.entry.fid, bytes: pendingImport.bytes.length })
+              : t("certs.importNew", { bytes: pendingImport.bytes.length, fid: pendingImport.entry.fid })
           }
-          confirmLabel="Import"
+          confirmLabel={t("certs.importConfirm")}
           danger={pendingImport.entry.has_cert}
           busy={importing}
           onConfirm={() => void runImport()}

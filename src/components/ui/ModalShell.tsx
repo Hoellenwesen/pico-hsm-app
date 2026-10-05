@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { Button } from "./Button";
 import { Card } from "./Card";
+import { useLang } from "../../lib/i18n/LangContext";
 
 /**
  * Shared modal shell: backdrop click and ESC close without action
@@ -46,9 +47,10 @@ export function ModalShell({
 
 /** Standard no-action footer button for all popups. */
 export function ModalCancel({ onCancel, busy = false }: { onCancel: () => void; busy?: boolean }) {
+  const { t } = useLang();
   return (
     <Button variant="ghost" disabled={busy} onClick={onCancel}>
-      Cancel
+      {t("common.cancel")}
     </Button>
   );
 }

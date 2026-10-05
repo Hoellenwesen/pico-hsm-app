@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Archive,
   Award,
@@ -19,20 +19,39 @@ import {
 import { toast } from "sonner";
 import { cn } from "../../lib/utils";
 import { formatClock } from "../../lib/format";
+import { useLang } from "../../lib/i18n/LangContext";
 import type { DeviceState } from "../../hooks/useDevice";
 import { Switch } from "../ui/Switch";
 import { Badge } from "../ui/Badge";
 
 export type TabId = "dashboard" | "keys" | "certs" | "backup" | "device" | "firmware" | "logs";
 
-export const tabs: { id: TabId; label: string; icon: typeof LayoutDashboard }[] = [
-  { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { id: "keys", label: "Keys", icon: KeyRound },
-  { id: "certs", label: "Certificates", icon: Award },
-  { id: "backup", label: "Backup & Restore", icon: Archive },
-  { id: "device", label: "Device Config", icon: Cpu },
-  { id: "firmware", label: "Firmware", icon: HardDriveDownload },
-  { id: "logs", label: "Logs", icon: ScrollText },
+/** Device clock, advanced locally each second. Owns its ticker so the rest
+ * of the app does NOT re-render every second (used to live in useDevice). */
+function Clock({ rtcDate }: { rtcDate: Date | null }) {
+  const [, setTick] = useState(0);
+  const liveAt = useRef(Date.now());
+  useEffect(() => {
+    liveAt.current = Date.now();
+  }, [rtcDate]);
+  useEffect(() => {
+    const t = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const now = !rtcDate ? null : new Date(rtcDate.getTime() + (Date.now() - liveAt.current));
+  return (
+    <span className="font-mono text-xs font-medium tabular-nums">{now ? formatClock(now) : "--"}</span>
+  );
+}
+
+export const tabs: { id: TabId; icon: typeof LayoutDashboard }[] = [
+  { id: "dashboard", icon: LayoutDashboard },
+  { id: "keys", icon: KeyRound },
+  { id: "certs", icon: Award },
+  { id: "backup", icon: Archive },
+  { id: "device", icon: Cpu },
+  { id: "firmware", icon: HardDriveDownload },
+  { id: "logs", icon: ScrollText },
 ];
 
 export function Sidebar({
@@ -51,10 +70,11 @@ export function Sidebar({
   // Two-step confirm: first toggle arms, second toggle within 6 s reboots.
   const [armed, setArmed] = useState(false);
   const [rebooting, setRebooting] = useState(false);
+  const { lang, setLang, t, terr } = useLang();
   useEffect(() => {
     if (!armed) return;
-    const t = setTimeout(() => setArmed(false), 6000);
-    return () => clearTimeout(t);
+    const timer = setTimeout(() => setArmed(false), 6000);
+    return () => clearTimeout(timer);
   }, [armed]);
 
   async function handleBootsel(v: boolean) {
@@ -65,13 +85,13 @@ export function Sidebar({
       return;
     }
     if (!device.online) {
-      toast.error("No device connected", { description: "Connect the Pico HSM first." });
+      toast.error(t("sidebar.noDevice"), { description: t("sidebar.noDeviceHint") });
       return;
     }
     if (!armed) {
       setArmed(true);
-      toast.warning("Confirm reboot to BOOTSEL", {
-        description: "Toggle again within 6 s to reboot. Press the device button when it asks, then the device will disconnect.",
+      toast.warning(t("sidebar.confirmBootsel"), {
+        description: t("sidebar.confirmBootselHint"),
       });
       return;
     }
@@ -80,11 +100,12 @@ export function Sidebar({
     try {
       const msg = await device.rebootDevice(true);
       device.setBootsel(true);
-      toast.warning("Rebooting into BOOTSEL", { description: msg });
+      toast.warning(t("sidebar.rebootingBootsel"), { description: msg });
     } catch (e) {
       const err = e as { code?: string; message?: string; hint?: string };
-      toast.error(err.code === "RebootUnsupported" ? "Reboot not supported here" : "Reboot failed", {
-        description: err.hint || err.message || String(e),
+      const text = terr(err as import("../../lib/tauri").DeviceError);
+      toast.error(err.code === "RebootUnsupported" ? t("sidebar.rebootNotSupported") : t("sidebar.rebootFailed"), {
+        description: text.hint || text.message,
       });
     } finally {
       setRebooting(false);
@@ -106,16 +127,17 @@ export function Sidebar({
       </div>
 
       <nav className="flex-1 space-y-1 overflow-y-auto p-3">
-        {tabs.map((t) => {
-          const Icon = t.icon;
-          const isActive = t.id === active;
-          const gated = t.id !== "dashboard" && !device.online;
+        {tabs.map((tab) => {
+          const Icon = tab.icon;
+          const isActive = tab.id === active;
+          const gated = tab.id !== "dashboard" && !device.online;
+          const label = t(`nav.${tab.id}`);
           return (
             <button
-              key={t.id}
-              onClick={() => onNavigate(t.id)}
+              key={tab.id}
+              onClick={() => onNavigate(tab.id)}
               disabled={gated}
-              title={gated ? "Connect a device first" : t.label}
+              title={gated ? t("app.connectFirst") : label}
               className={cn(
                 "flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors",
                 isActive ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:bg-muted hover:text-foreground",
@@ -123,7 +145,7 @@ export function Sidebar({
               )}
             >
               <Icon size={17} />
-              {t.label}
+              {label}
             </button>
           );
         })}
@@ -133,38 +155,52 @@ export function Sidebar({
         <div className="flex items-center justify-between">
           <span className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
             {device.online ? <Wifi size={14} className="text-emerald-500" /> : <WifiOff size={14} className="text-muted-foreground" />}
-            Device
+            {t("sidebar.device")}
           </span>
           <Badge variant={device.online ? "success" : "outline"}>
             <span className={cn("h-1.5 w-1.5 rounded-full", device.online ? "bg-emerald-500" : "bg-muted-foreground")} />
-            {device.online ? "Online" : "Offline"}
+            {device.online ? t("sidebar.online") : t("sidebar.offline")}
           </Badge>
         </div>
 
         <div className="flex items-center justify-between gap-2">
           <span className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
             <Usb size={14} className={device.bootsel ? "text-amber-500" : undefined} />
-            BOOTSEL
+            {t("sidebar.bootsel")}
           </span>
           <Switch
             checked={device.bootsel}
-            label={device.bootsel ? "Recovery" : "Normal"}
+            label={device.bootsel ? t("sidebar.recovery") : t("sidebar.normal")}
             onCheckedChange={(v) => void handleBootsel(v)}
           />
         </div>
 
         <div className="flex items-center justify-between gap-2 rounded-lg bg-muted/60 px-2.5 py-2">
           <span className="flex items-center gap-2 text-xs text-muted-foreground">
-            <Clock3 size={14} /> Time
+            <Clock3 size={14} /> {t("sidebar.time")}
           </span>
-          <span className="font-mono text-xs font-medium tabular-nums">{device.now ? formatClock(device.now) : "--"}</span>
+          <Clock rtcDate={device.live.rtcDate} />
         </div>
 
-        <div className="flex items-center justify-end">
+        <div className="flex items-center justify-between">
+          <div className="flex overflow-hidden rounded-md border border-border text-xs font-medium">
+            {(["en", "de"] as const).map((l) => (
+              <button
+                key={l}
+                onClick={() => setLang(l)}
+                title={l === "en" ? "English" : "Deutsch"}
+                className={`px-2 py-1 uppercase ${
+                  lang === l ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {l}
+              </button>
+            ))}
+          </div>
           <button
             onClick={onToggleTheme}
             className="flex h-7 w-7 items-center justify-center rounded-md border border-border text-muted-foreground hover:text-foreground"
-            title="Toggle theme"
+            title={t("sidebar.theme")}
           >
             {dark ? <Sun size={14} /> : <Moon size={14} />}
           </button>

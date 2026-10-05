@@ -9,6 +9,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../co
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { NA } from "../components/ui/NA";
 import { Switch } from "../components/ui/Switch";
+import { useLang } from "../lib/i18n/LangContext";
 import type { DeviceError } from "../lib/tauri";
 import type { DeviceState } from "../hooks/useDevice";
 
@@ -16,6 +17,7 @@ function OptionsCard({ device }: { device: DeviceState }) {
   const [press, setPress] = useState<boolean | null>(null);
   const [counter, setCounter] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
+  const { t, terr } = useLang();
 
   useEffect(() => {
     if (busy) return;
@@ -28,13 +30,14 @@ function OptionsCard({ device }: { device: DeviceState }) {
     setBusy(true);
     try {
       const msg = await device.saveDynops(press, counter);
-      toast.success("Options updated", { description: msg });
+      toast.success(t("dev.optionsUpdated"), { description: msg });
     } catch (e) {
       const err = e as DeviceError;
       if (err?.auth_required) {
-        toast.info("Login required", { description: "Enter the User-PIN, then save again." });
+        toast.info(t("common.loginRequired"), { description: t("common.loginAgain") });
       } else {
-        toast.error("Options update failed", { description: err.hint ? `${err.message}. ${err.hint}` : err.message });
+        const text = terr(err);
+        toast.error(t("dev.optionsFailed"), { description: text.hint ? `${text.message}. ${text.hint}` : text.message });
       }
     } finally {
       setBusy(false);
@@ -45,10 +48,10 @@ function OptionsCard({ device }: { device: DeviceState }) {
     <Card>
       <CardHeader>
         <CardTitle>
-          <SlidersHorizontal size={16} className="text-primary" /> Dynamic options
+          <SlidersHorizontal size={16} className="text-primary" /> {t("dev.optionsTitle")}
         </CardTitle>
         <CardDescription>
-          Changeable without re-initialization. Saving needs User-PIN login. Secure-lock bit is never touched.
+          {t("dev.optionsSub")}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -57,24 +60,24 @@ function OptionsCard({ device }: { device: DeviceState }) {
         ) : (
           <>
             <div className="flex flex-wrap gap-x-6 gap-y-2">
-              <Switch checked={press} onCheckedChange={setPress} label="Press-to-confirm button" />
-              <Switch checked={counter} onCheckedChange={setCounter} label="Key usage counter for all keys" />
+              <Switch checked={press} onCheckedChange={setPress} label={t("dev.pressConfirm")} />
+              <Switch checked={counter} onCheckedChange={setCounter} label={t("dev.keyCounter")} />
             </div>
             <div className="flex items-center gap-2 text-sm">
-              <span className="text-muted-foreground">Secure lock:</span>
+              <span className="text-muted-foreground">{t("dev.secureLock")}</span>
               {device.securityOpts ? (
                 <Badge variant={device.securityOpts.secureLock ? "warning" : "outline"}>
-                  {device.securityOpts.secureLock ? "ENABLED (read-only)" : "OFF"}
+                  {device.securityOpts.secureLock ? t("dev.secureLockOn") : t("dev.secureOff")}
                 </Badge>
               ) : (
                 <NA />
               )}
               {!device.unlocked && (
-                <span className="text-xs text-muted-foreground">(unlock with User-PIN to save)</span>
+                <span className="text-xs text-muted-foreground">{t("dev.unlockHint")}</span>
               )}
             </div>
             <Button variant="primary" disabled={!device.online || busy} onClick={() => void save()}>
-              {busy ? "Saving…" : "Save options"}
+              {busy ? t("dev.saving") : t("dev.saveOptions")}
             </Button>
           </>
         )}
@@ -84,11 +87,12 @@ function OptionsCard({ device }: { device: DeviceState }) {
 }
 
 export function DeviceConfig({ device }: { device: DeviceState }) {
+  const { t } = useLang();
   return (
     <div className="space-y-5">
       <div>
-        <h1 className="text-xl font-bold tracking-tight">Device Config</h1>
-        <p className="text-sm text-muted-foreground">Dynamic options and PIN management.</p>
+        <h1 className="text-xl font-bold tracking-tight">{t("dev.title")}</h1>
+        <p className="text-sm text-muted-foreground">{t("dev.sub")}</p>
       </div>
 
       <OptionsCard device={device} />
@@ -110,6 +114,7 @@ function InitializationCard({ device }: { device: DeviceState }) {
   const [wipeOk, setWipeOk] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const { t, terr } = useLang();
 
   const userOk = userPin.length >= 6 && userPin.length <= 16 && userPin === userRepeat;
   const soOk = /^[0-9A-Fa-f]{16}$/.test(soPin) && soPin === soRepeat;
@@ -130,11 +135,11 @@ function InitializationCard({ device }: { device: DeviceState }) {
         dkek === "slots" ? slots : null,
         false,
       );
-      toast.success("Device initialized", {
+      toast.success(t("dev.initialized"), {
         description:
           dkek === "slots"
-            ? `${msg} Generate ${slots} share(s) in the Backup tab and import them to complete the domain.`
-            : `${msg} Session unlocked.`,
+            ? `${msg} ${t("dev.initSharesNext", { n: slots })}`
+            : `${msg} ${t("dev.sessionUnlocked")}`,
       });
       setUserPin("");
       setUserRepeat("");
@@ -142,9 +147,9 @@ function InitializationCard({ device }: { device: DeviceState }) {
       setSoRepeat("");
       setWipeOk(false);
     } catch (e) {
-      const err = e as DeviceError;
-      toast.error("Initialization failed", {
-        description: err.hint ? `${err.message}. ${err.hint}` : err.message || String(e),
+      const text = terr(e as DeviceError);
+      toast.error(t("dev.initFailed"), {
+        description: text.hint ? `${text.message}. ${text.hint}` : text.message,
       });
     } finally {
       setBusy(false);
@@ -155,14 +160,14 @@ function InitializationCard({ device }: { device: DeviceState }) {
     <Card>
       <CardHeader>
         <CardTitle>
-          <Rocket size={16} className="text-primary" /> Initialization
+          <Rocket size={16} className="text-primary" /> {t("dev.initTitle")}
         </CardTitle>
         <CardDescription>
-          First setup — or full wipe and re-setup.{" "}
+          {t("dev.initSub")}{" "}
           {device.initState === "uninitialized" ? (
-            <Badge variant="warning">Not initialized</Badge>
+            <Badge variant="warning">{t("dev.initNotInit")}</Badge>
           ) : device.initState === "initialized" ? (
-            <Badge variant="success">Initialized</Badge>
+            <Badge variant="success">{t("dev.initDone")}</Badge>
           ) : (
             <NA />
           )}
@@ -171,24 +176,24 @@ function InitializationCard({ device }: { device: DeviceState }) {
       <CardContent className="space-y-3">
         {initialized && (
           <p className="text-sm text-amber-500">
-            This device is initialized — running this erases all keys and starts over.
+            {t("dev.initWarnInit")}
           </p>
         )}
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="space-y-2">
-            <p className="text-xs text-muted-foreground">User-PIN (6–16 chars)</p>
-            <PinInput value={userPin} onChange={setUserPin} placeholder="New User-PIN" />
-            <PinInput value={userRepeat} onChange={setUserRepeat} placeholder="Repeat User-PIN" />
+            <p className="text-xs text-muted-foreground">{t("dev.userPin")}</p>
+            <PinInput value={userPin} onChange={setUserPin} placeholder={t("dev.newUserPin")} />
+            <PinInput value={userRepeat} onChange={setUserRepeat} placeholder={t("dev.repeatUserPin")} />
           </div>
           <div className="space-y-2">
-            <p className="text-xs text-muted-foreground">SO-PIN (exactly 16 hex chars, same as change/unblock)</p>
-            <PinInput value={soPin} onChange={setSoPin} placeholder="New SO-PIN (16 hex)" />
-            <PinInput value={soRepeat} onChange={setSoRepeat} placeholder="Repeat SO-PIN" />
+            <p className="text-xs text-muted-foreground">{t("dev.soPin")}</p>
+            <PinInput value={soPin} onChange={setSoPin} placeholder={t("dev.newSoPin")} />
+            <PinInput value={soRepeat} onChange={setSoRepeat} placeholder={t("dev.repeatSoPin")} />
           </div>
         </div>
         <div className="grid gap-3 sm:grid-cols-2">
           <label className="block text-sm">
-            <span className="mb-1 block text-xs text-muted-foreground">User-PIN retries (1–15)</span>
+            <span className="mb-1 block text-xs text-muted-foreground">{t("dev.retries")}</span>
             <input
               type="number"
               min={1}
@@ -199,14 +204,14 @@ function InitializationCard({ device }: { device: DeviceState }) {
             />
           </label>
           <label className="block text-sm">
-            <span className="mb-1 block text-xs text-muted-foreground">DKEK at setup</span>
+            <span className="mb-1 block text-xs text-muted-foreground">{t("dev.dkekSetup")}</span>
             <select
               value={dkek}
               onChange={(e) => setDkek(e.target.value as "none" | "slots")}
               className="h-9 rounded-lg border border-border bg-background px-2 text-sm outline-none focus:border-primary"
             >
-              <option value="none">None</option>
-              <option value="slots">N empty slots (shares come from the Backup tab)</option>
+              <option value="none">{t("dev.dkekNone")}</option>
+              <option value="slots">{t("dev.dkekSlots")}</option>
             </select>
             {dkek === "slots" && (
               <input
@@ -227,18 +232,18 @@ function InitializationCard({ device }: { device: DeviceState }) {
             onChange={(e) => setWipeOk(e.target.checked)}
             className="mt-1 h-4 w-4 accent-current"
           />
-          I understand this erases all keys and credentials on the device.
+          {t("dev.wipeCheck")}
         </label>
         <Button variant="primary" disabled={!canSubmit} onClick={() => setConfirming(true)}>
-          {busy ? "Initializing…" : "Initialize device"}
+          {busy ? t("dev.initializing") : t("dev.initBtn")}
         </Button>
       </CardContent>
 
       {confirming && (
         <ConfirmDialog
-          title="Initialize device and erase everything?"
-          description="This wipes all keys, certificates and PINs, then sets up the device with the entered values. This cannot be undone without a DKEK backup."
-          confirmLabel="Initialize now"
+          title={t("dev.initConfirmTitle")}
+          description={t("dev.initConfirmDesc")}
+          confirmLabel={t("dev.initNow")}
           danger
           busy={busy}
           onConfirm={() => void runInit()}

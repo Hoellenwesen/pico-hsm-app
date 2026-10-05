@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { Button } from "./ui/Button";
 import { CardContent, CardDescription, CardHeader, CardTitle } from "./ui/Card";
 import { ModalCancel, ModalShell } from "./ui/ModalShell";
+import { useLang } from "../lib/i18n/LangContext";
 import type { DeviceState } from "../hooks/useDevice";
 
 /**
@@ -13,6 +14,7 @@ import type { DeviceState } from "../hooks/useDevice";
 export function PinDialog({ device }: { device: DeviceState }) {
   const [pin, setPin] = useState("");
   const [busy, setBusy] = useState(false);
+  const { t, terr } = useLang();
 
   useEffect(() => {
     if (device.pinRequired) setPin("");
@@ -26,13 +28,14 @@ export function PinDialog({ device }: { device: DeviceState }) {
     setBusy(true);
     try {
       const msg = await device.login(pin);
-      toast.success("Unlocked", { description: msg });
+      toast.success(t("pinDialog.unlocked"), { description: msg });
     } catch (err) {
       const e = err as { code?: string; message?: string; hint?: string };
       // Wrong PIN shows retries left; anything else a generic error.
       // The PIN itself is never echoed.
-      toast.error(e.code === "WrongPin" ? "Wrong PIN" : "Login failed", {
-        description: e.hint ? `${e.message}. ${e.hint}` : e.message || String(err),
+      const text = terr({ code: e.code ?? "", message: e.message ?? "", hint: e.hint ?? "" });
+      toast.error(e.code === "WrongPin" ? t("pinDialog.wrong") : t("pinDialog.loginFailed"), {
+        description: text.hint ? `${text.message}. ${text.hint}` : text.message,
       });
     } finally {
       setBusy(false);
@@ -44,11 +47,10 @@ export function PinDialog({ device }: { device: DeviceState }) {
     <ModalShell onCancel={() => device.dismissPin()} busy={busy}>
         <CardHeader>
           <CardTitle>
-            <KeyRound size={16} className="text-primary" /> Enter User-PIN
+            <KeyRound size={16} className="text-primary" /> {t("pinDialog.title")}
           </CardTitle>
           <CardDescription>
-            Required for protected operations (key management, certificates, backup). The PIN stays
-            in memory only and is cleared on disconnect. The device stays unlocked until unplugged.
+            {t("pinDialog.sub")}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -64,7 +66,7 @@ export function PinDialog({ device }: { device: DeviceState }) {
               className="h-9 min-w-0 flex-1 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-primary"
             />
             <Button variant="primary" type="submit" disabled={!pin || busy}>
-              Unlock
+              {t("pinDialog.unlock")}
             </Button>
             <ModalCancel onCancel={() => device.dismissPin()} busy={busy} />
           </form>

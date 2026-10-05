@@ -134,6 +134,15 @@ Stand: 02.10.2026. Konsolidiert aus `roadmap.md`, `docs/open-points.md`,
 
 ## Teil II — Rest-Implementierung (nach Abnahme)
 
+- **Ticker-Entkopplung (erledigt)**: 1-s-Ticker aus `useDevice` entfernt
+  (ganzer Baum rendete sekündlich neu); Sidebar-`Clock` mit lokalem Ticker.
+- **i18n-Migration (abgeschlossen)**: `src/lib/i18n/` mit DE/EN-Katalogen
+  (alle Backend-Codes + alle UI-Tabs/Dialoge/Toasts), `LangProvider`,
+  Sidebar-Switch, OS-Locale-Default, Paritäts-Tests. Alle Tabs + Dialoge +
+  Fehlerpfade laufen über `t()`/`terr()`; technische IDs (Kurven, Algo-Bytes,
+  FIDs, SW-Codes) bleiben Englisch. Diagnose-Feldfehler bewusst roh
+  (Remote-Debugging).
+
 - **Slice 5 Firmware-Follow-ups**: Toleranzpfad ins Flash-Log stempeln;
   `find_bootsel_drive` in Diagnose nutzen oder streichen; Unit-Tests
   `read_sidecar_hash` (Temp-FS) + 3-MB-Cap; oben offene HW-Pfade nachholen.

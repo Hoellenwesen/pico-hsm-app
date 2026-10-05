@@ -5,6 +5,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/
 import { NA } from "./ui/NA";
 import { tauriApi, type DeviceError, type TransmitResult } from "../lib/tauri";
 import { audit } from "../lib/auditLog";
+import { useLang } from "../lib/i18n/LangContext";
 import type { DeviceState } from "../hooks/useDevice";
 import type { PinStatus } from "../lib/tauri";
 
@@ -17,6 +18,7 @@ function pinText(pin: PinStatus | null): string {
 
 /** Raw device values + field errors for troubleshooting. Collapsed by default. */
 export function Diagnose({ device }: { device: DeviceState }) {
+  const { t, terr } = useLang();
   const [open, setOpen] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [apdu, setApdu] = useState("00B1C402045402000000");
@@ -61,13 +63,13 @@ export function Diagnose({ device }: { device: DeviceState }) {
       >
         <CardHeader>
           <CardTitle>
-            <Wrench size={16} className="text-muted-foreground" /> Details / Diagnose
+            <Wrench size={16} className="text-muted-foreground" /> {t("diag.title")}
             <ChevronDown
               size={16}
               className={`ml-auto text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`}
             />
           </CardTitle>
-          <CardDescription>ATR, Version, Memory, PIN, RTC — raw values.</CardDescription>
+          <CardDescription>{t("diag.sub")}</CardDescription>
         </CardHeader>
       </div>
       {open && (
@@ -115,21 +117,21 @@ export function Diagnose({ device }: { device: DeviceState }) {
                       minute: now.getMinutes(),
                       second: now.getSeconds(),
                     });
-                    toast.success("Clock synchronized", { description: msg });
+                    toast.success(t("diag.synced"), { description: msg });
                   } catch (e) {
-                    const err = e as { hint?: string; message?: string };
-                    toast.error("Clock sync failed", { description: err.hint || err.message || String(e) });
+                    const text = terr(e as DeviceError);
+                    toast.error(t("diag.syncFailed"), { description: text.hint ? `${text.message}. ${text.hint}` : text.message });
                   } finally {
                     setSyncing(false);
                   }
                 }}
               >
-                {syncing ? "Syncing…" : "Sync with host time"}
+                {syncing ? t("diag.syncing") : t("diag.sync")}
               </button>
             )}
           </span>
           <span className="text-muted-foreground">
-            Firmware:{" "}
+            {t("diag.firmware")}{" "}
             {device.live.platform ? (
               <span className="font-mono font-medium text-foreground">v{device.live.platform.version} (rescue)</span>
             ) : device.live.version ? (
@@ -141,7 +143,7 @@ export function Diagnose({ device }: { device: DeviceState }) {
             )}
           </span>
           <span className="text-muted-foreground">
-            Board id:{" "}
+            {t("diag.boardId")}{" "}
             {device.live.platform ? (
               <span className="font-mono font-medium text-foreground">{device.live.platform.board_hex}</span>
             ) : (
@@ -149,7 +151,7 @@ export function Diagnose({ device }: { device: DeviceState }) {
             )}
           </span>
           <span className="text-muted-foreground">
-            PIN retries:{" "}
+            {t("diag.pinRetries")}{" "}
             {device.live.pin || device.live.sopin ? (
               <span className="font-mono font-medium text-foreground">
                 user {pinText(device.live.pin)} · so {pinText(device.live.sopin)}
@@ -159,7 +161,7 @@ export function Diagnose({ device }: { device: DeviceState }) {
             )}
           </span>
           <span className="text-muted-foreground">
-            Memory raw:{" "}
+            {t("diag.memoryRaw")}{" "}
             {device.live.flash ? (
               <span className="font-mono font-medium text-foreground">{device.live.flash.raw_hex}</span>
             ) : (
@@ -175,7 +177,7 @@ export function Diagnose({ device }: { device: DeviceState }) {
             device.live.fieldErrors.sopin ||
             device.live.fieldErrors.platform) && (
             <span className="text-muted-foreground">
-              Field errors:{" "}
+              {t("diag.fieldErrors")}{" "}
               <span className="font-mono font-medium text-amber-500">
                 {[
                   device.live.fieldErrors.rtc && `rtc(${device.live.fieldErrors.rtc})`,
@@ -195,21 +197,21 @@ export function Diagnose({ device }: { device: DeviceState }) {
         </div>
         <div>
           <div className="mb-1 flex items-center justify-between">
-            <span className="text-xs font-medium text-muted-foreground">ATR (Answer To Reset)</span>
+            <span className="text-xs font-medium text-muted-foreground">{t("diag.atr")}</span>
             {device.live.atrHex && (
               <button
                 className="flex items-center gap-1 rounded p-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
-                title="Copy ATR"
+                title={t("diag.copyAtr")}
                 onClick={async () => {
                   try {
                     await navigator.clipboard.writeText(device.live.atrHex ?? "");
-                    toast.success("ATR copied");
+                    toast.success(t("diag.atrCopied"));
                   } catch {
                     toast.info("ATR", { description: device.live.atrHex ?? "" });
                   }
                 }}
               >
-                <Copy size={13} /> Copy
+                <Copy size={13} /> {t("diag.copy")}
               </button>
             )}
           </div>
@@ -226,14 +228,14 @@ export function Diagnose({ device }: { device: DeviceState }) {
         <div>
           <div className="mb-1 flex items-center justify-between">
             <span className="text-xs font-medium text-muted-foreground">
-              Raw APDU console (applet is selected atomically per send)
+              {t("diag.rawTitle")}
             </span>
             {trace.length > 0 && (
               <button
                 className="rounded p-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
                 onClick={() => setTrace([])}
               >
-                Clear
+                {t("diag.clear")}
               </button>
             )}
           </div>
@@ -242,7 +244,7 @@ export function Diagnose({ device }: { device: DeviceState }) {
               value={applet}
               disabled={!device.online || sending}
               onChange={(e) => setApplet(e.currentTarget.value)}
-              title="Applet to select before transmitting"
+              title={t("diag.appletTitle")}
               className="h-9 shrink-0 rounded-lg border border-border bg-background px-2 font-mono text-xs outline-none focus:border-primary"
             >
               <option value="hsm">HSM</option>
@@ -255,12 +257,12 @@ export function Diagnose({ device }: { device: DeviceState }) {
               onKeyDown={(e) => {
                 if (e.key === "Enter") void send();
               }}
-              placeholder="e.g. 00B1C40204540200000000"
+              placeholder={t("diag.apduPh")}
               spellCheck={false}
               className="h-9 min-w-0 flex-1 rounded-lg border border-border bg-background px-3 font-mono text-xs outline-none focus:border-primary"
             />
             <button
-              title="Send APDU"
+              title={t("diag.sendTitle")}
               disabled={!device.online || sending || apdu.trim() === ""}
               onClick={() => void send()}
               className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground disabled:opacity-50"
@@ -270,16 +272,16 @@ export function Diagnose({ device }: { device: DeviceState }) {
           </div>
           {trace.length > 0 && (
             <div className="mt-2 max-h-48 space-y-1 overflow-y-auto rounded-lg bg-muted/60 p-3 font-mono text-xs leading-relaxed">
-              {trace.map((t, i) => (
+              {trace.map((tr, i) => (
                 <div key={i} className="break-all">
-                  <div className="text-sky-500">→ {t.sent}</div>
-                  {typeof t.resp === "string" ? (
-                    <div className="text-red-500">✕ {t.resp}</div>
+                  <div className="text-sky-500">→ {tr.sent}</div>
+                  {typeof tr.resp === "string" ? (
+                    <div className="text-red-500">✕ {tr.resp}</div>
                   ) : (
                     <>
-                      <div className="break-all text-foreground">{t.resp.data_hex === "" ? "(no data)" : t.resp.data_hex}</div>
-                      <div className={t.resp.sw_hex === "9000" ? "text-emerald-500" : "text-amber-500"}>
-                        SW={t.resp.sw_hex}
+                      <div className="break-all text-foreground">{tr.resp.data_hex === "" ? t("diag.noData") : tr.resp.data_hex}</div>
+                      <div className={tr.resp.sw_hex === "9000" ? "text-emerald-500" : "text-amber-500"}>
+                        SW={tr.resp.sw_hex}
                       </div>
                     </>
                   )}
