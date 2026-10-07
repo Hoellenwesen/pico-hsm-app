@@ -4,7 +4,7 @@ Cross-platform manager for [Pico HSM](https://github.com/polhenarejos/pico-hsm)
 tokens — Tauri 2 + React 19 + TypeScript frontend, Rust/PC/SC backend.
 HSM-only scope (no FIDO/OpenPGP). Windows-first, Linux-capable.
 
-### This is an alternative App to manage the Pico HSM device. I created it mostly for myself but feel free to use it at your own risk. If you need a proper developed, enterprise grade application then i would recommend using the official one provided by PicoKeys (https://www.picokeys.com/picokeyapp/).
+### INFO: This is an alternative App to manage the Pico HSM device. I created it mostly for myself but feel free to use it at your own risk. If you need a proper developed, enterprise grade application then i would recommend using the official one provided by PicoKeys (https://www.picokeys.com/picokeyapp/).
 
 ## Features
 
